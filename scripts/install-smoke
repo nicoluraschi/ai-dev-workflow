@@ -1,0 +1,130 @@
+#!/usr/bin/env python3
+"""install-smoke: prove install.sh works from a clean checkout, with and without an overlay.
+
+Copies the repo's working tree (tracked and untracked-unignored files) into a temp dir and runs
+the copy's install.sh with HOME set to a fresh temp dir; the real $HOME is never used. Then:
+
+  1. run 1, on a fresh HOME with overlay/ removed from the copy: the installer must exit 0 and
+     leave no dangling symlink under the temp HOME;
+  2. run 2, on another fresh HOME with overlay/ present (a fake one is added when the repo has
+     none): the same;
+  3. run 3, same HOME as run 2, after overlay/ is removed from the copy: the same, and no link
+     under the temp HOME may point into the copy's overlay/.
+
+Exit 0 ok, 1 a check failed, 2 setup error. Stdlib only.
+"""
+import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+
+
+def copy_working_tree(dest):
+    r = subprocess.run(["git", "ls-files", "-z", "--cached", "--others", "--exclude-standard"],
+                       cwd=ROOT, capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"git ls-files failed: {r.stderr.strip()}")
+    for rel in sorted({p for p in r.stdout.split("\0") if p}):
+        src = ROOT / rel
+        if not (src.is_symlink() or src.exists()):
+            continue  # tracked but deleted in the working tree
+        target = dest / rel
+        target.parent.mkdir(parents=True, exist_ok=True)
+        if src.is_symlink():
+            os.symlink(os.readlink(src), target)
+        else:
+            shutil.copy2(src, target)
+
+
+def fresh(tmp, name):
+    """A copy of the working tree and an empty HOME, both new."""
+    repo, home = tmp / name / "repo", tmp / name / "home"
+    repo.mkdir(parents=True)
+    home.mkdir()
+    copy_working_tree(repo)
+    return repo, home
+
+
+def add_fake_overlay(repo):
+    if not (repo / "overlay").exists():
+        skill = repo / "overlay/claude/skills/fake-overlay-skill"
+        skill.mkdir(parents=True)
+        (skill / "SKILL.md").write_text("---\nname: fake-overlay-skill\n---\nA fake overlay skill.\n")
+
+
+def run_installer(repo, home, label):
+    print(f"--- {label} ---", flush=True)
+    env = {**os.environ, "HOME": str(home)}
+    r = subprocess.run(["bash", str(repo / "install.sh")], cwd=repo, env=env, text=True,
+                       stdin=subprocess.DEVNULL, capture_output=True, timeout=600, errors="replace")
+    print(r.stdout + r.stderr, end="", flush=True)
+    return r.returncode
+
+
+def links(home):
+    for dirpath, dirs, files in os.walk(home):
+        for name in dirs + files:
+            p = Path(dirpath) / name
+            if p.is_symlink():
+                yield p
+
+
+def problems(home, repo, overlay_removed):
+    out = []
+    overlay = str(repo / "overlay") + os.sep
+    for link in links(home):
+        target = os.readlink(link)
+        full = target if os.path.isabs(target) else os.path.join(os.path.dirname(link), target)
+        if not os.path.exists(full):
+            out.append(f"dangling link: {link.relative_to(home)} -> {target}")
+        if overlay_removed and os.path.normpath(full).startswith(overlay):
+            out.append(f"link into the removed overlay: {link.relative_to(home)} -> {target}")
+    return out
+
+
+def main():
+    failures = []
+    with tempfile.TemporaryDirectory(prefix="install-smoke-") as td:
+        tmp = Path(td).resolve()
+        try:
+            # A: a clean checkout with no overlay at all, on its own fresh HOME.
+            repo_a, home_a = fresh(tmp, "a")
+            if (repo_a / "overlay").exists():
+                shutil.rmtree(repo_a / "overlay")
+            # B: overlay present, then removed, on another fresh HOME.
+            repo_b, home_b = fresh(tmp, "b")
+        except Exception as e:
+            print(f"install-smoke: cannot copy the repo: {e}", file=sys.stderr)
+            return 2
+
+        code = run_installer(repo_a, home_a, "run 1: no overlay, fresh HOME")
+        if code != 0:
+            failures.append(f"install.sh exited {code} with no overlay on a fresh HOME")
+        failures += problems(home_a, repo_a, overlay_removed=True)
+
+        add_fake_overlay(repo_b)
+        code = run_installer(repo_b, home_b, "run 2: overlay present, fresh HOME")
+        if code != 0:
+            failures.append(f"install.sh exited {code} with the overlay present")
+        failures += problems(home_b, repo_b, overlay_removed=False)
+
+        shutil.rmtree(repo_b / "overlay")
+        code = run_installer(repo_b, home_b, "run 3: overlay removed, same HOME")
+        if code != 0:
+            failures.append(f"install.sh exited {code} with the overlay removed")
+        failures += problems(home_b, repo_b, overlay_removed=True)
+
+    for f in failures:
+        print(f"install-smoke: FAIL {f}")
+    if failures:
+        return 1
+    print("install-smoke: ok (exit 0, no dangling link, no link left into the removed overlay)")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,23 @@
+# Never commit machine-local, state, or secret files.
+
+# Local / per-machine overrides
+*.local.json
+settings.local.json
+
+# Secrets and env
+.env
+.env.*
+*.secret
+*.pem
+*.key
+credentials.json
+
+# Backups created by install.sh
+*.backup.*
+
+# macOS cruft
+.DS_Store
+
+# Python bytecode from the hook tests
+__pycache__/
+*.pyc

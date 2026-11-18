@@ -1,0 +1,424 @@
+#!/usr/bin/env python3
+"""privacy-check: refuse text that would leak private data into the public repo.
+
+  privacy-check PATH...                 files, or directories (git: tracked + untracked-unignored
+                                        files; otherwise a walk; .git is always skipped)
+  privacy-check --stdin                 text on stdin
+  privacy-check --range OLD..NEW        every commit in a revision range: added lines of its patch,
+                                        message, author and committer email, the refs pointing into
+                                        it and annotated tag messages and tagger emails. A bare
+                                        revision scans its whole history. Run it inside the repo.
+  privacy-check --private ...           also: the extra scanner (BANNED hits, minus the
+                                        allowlist) and every term of the private denylist
+  privacy-check --check-allow           fail when an allowlist word overlaps a denylist term
+
+Generic patterns (always, CI included): absolute home paths, emails other than noreply or
+reserved-domain ones, `<sub>.atlassian.net` hosts other than `example`, and links to another
+repo of the owner's. They hold no private data, so hits print their match.
+
+--private needs `gitleaks` on PATH, $HOME/.config/ai-workflow/extra-scanner (a regular file, not
+a symlink, holding one line: the absolute path of the extra scanner, run as `python3 -I <path>
+<dir>`) and a non-empty $HOME/.config/ai-workflow/privacy-denylist (one case-insensitive
+substring per line; blank lines and # comments ignored). Anything missing, empty, unreadable or
+malformed fails closed (exit 2), and errors never print the scanner's path. Private hits
+print only their location, never the matched text. WATCH lines are printed as info and never fail.
+Every path to private config derives from $HOME; there is no override. In --private mode a file
+that is binary or not UTF-8 (a PATH input, or added in a --range) fails closed with its path:
+the scanner cannot read it, so it must not pass unscanned. A range also scans every changed path
+name and the whole chain of a tag-of-tag; patches are read with --text so a `-diff` attribute
+hides nothing.
+
+The allowlist (`word<TAB>reason`, one exact word, a reason required) excuses a BANNED match only
+when every BANNED match on that line is allowlisted. It never excuses a denylist or generic hit.
+Default lookup: <git toplevel>/.privacy-allow, else <git toplevel>/export/root/.privacy-allow;
+--allow FILE overrides. --check-allow compares the allowlist with the denylist, so the denylist
+must hold client names for that check to cover them; it prints line numbers only.
+
+Exit: 0 clean, 1 hit, 2 internal error or a fail-closed condition. Stdlib only.
+"""
+import argparse
+import os
+import re
+import shutil
+import subprocess
+import sys
+import tempfile
+from pathlib import Path
+
+PUBLIC_REPO = "nicoluraschi/ai-dev-workflow"
+OWNER = PUBLIC_REPO.split("/")[0]
+PLACEHOLDER_USERS = {"x", "user", "me", "you", "example"}
+ALLOWED_EMAILS = {"41898282+github-actions[bot]@users.noreply.github.com", "noreply@github.com",
+                  "noreply@anthropic.com", "git@github.com"}
+NOREPLY = re.compile(r"\d+\+[\w-]+@users\.noreply\.github\.com", re.I)
+RESERVED_TLDS = {"example", "test", "invalid", "localhost"}
+RESERVED_DOMAINS = {"example.com", "example.org", "example.net"}
+
+# Markup tags between the prefix and the name (`<b>`) are skipped: rendered, it is a real path.
+HOME_PATH = re.compile(r"(?:(?<![\w/.}])|(?<=file://)|(?<=file://localhost))/(?:Users|home)/"
+                       r"(?:<[^<>/\s]*>)*([A-Za-z0-9_][\w.-]*)")
+EMAIL = re.compile(r"[A-Za-z0-9._%+\-\[\]]+@([A-Za-z0-9-]+(?:\.[A-Za-z0-9-]+)*\.[A-Za-z]{2,})")
+ATLASSIAN = re.compile(r"(?<![\w-])((?:[A-Za-z0-9][A-Za-z0-9-]*\.)+)atlassian\.net", re.I)
+REPO_LINK = re.compile(r"(?<![\w-])" + re.escape(OWNER) + r"/([\w.-]+)", re.I)
+
+BANNED_LINE = re.compile(r"^(BANNED|WATCH)\s+(\S+): '(.*)'$")
+ALLOW_WORD = re.compile(r"^[^\s\\^$.|?*+()\[\]{}]+$")
+
+
+class PrivacyError(Exception):
+    """An internal error or a fail-closed condition (exit 2)."""
+
+
+def generic_hits(line):
+    """[(kind, matched text)] for the generic patterns on one line."""
+    hits = []
+    for m in HOME_PATH.finditer(line):
+        if m.group(1).rstrip(".-").lower() not in PLACEHOLDER_USERS:
+            hits.append(("home path", m.group(0)))
+    for m in EMAIL.finditer(line):
+        email, domain = m.group(0).lower(), m.group(1).lower()
+        tld = domain.rsplit(".", 1)[-1]
+        reserved = (tld in RESERVED_TLDS or domain in RESERVED_DOMAINS
+                    or any(domain.endswith("." + d) for d in RESERVED_DOMAINS))
+        if not (email in ALLOWED_EMAILS or NOREPLY.fullmatch(email) or reserved):
+            hits.append(("email", m.group(0)))
+    for m in ATLASSIAN.finditer(line):
+        if (m.group(1) + "atlassian.net").lower() != "example.atlassian.net":
+            hits.append(("atlassian host", m.group(0)))
+    for m in REPO_LINK.finditer(line):
+        repo = re.sub(r"\.git$", "", m.group(1).rstrip(".")).lower()
+        if f"{OWNER}/{repo}".lower() != PUBLIC_REPO:
+            hits.append(("repo link", m.group(0)))
+    return hits
+
+
+def git(*args, cwd=None):
+    try:
+        r = subprocess.run(["git", "-c", "core.quotepath=off", *args], cwd=cwd, capture_output=True,
+                           text=True, errors="replace")
+    except OSError as e:
+        raise PrivacyError(f"cannot run git: {e}")
+    if r.returncode != 0:
+        raise PrivacyError(f"git {' '.join(args)} failed: {r.stderr.strip()}")
+    return r.stdout
+
+
+def text_items(label, text):
+    return [(f"{label}:{n}", line) for n, line in enumerate(text.splitlines(), 1)]
+
+
+def tracked_and_untracked(directory):
+    """Files git would publish, when `directory` is a checkout's top level; else None."""
+    try:
+        top = git("rev-parse", "--show-toplevel", cwd=directory).strip()
+    except PrivacyError:
+        return None
+    if os.path.realpath(top) != os.path.realpath(directory):
+        return None
+    out = git("ls-files", "-z", "-c", "-o", "--exclude-standard", cwd=directory)
+    return [os.path.join(directory, p) for p in out.split("\0") if p]
+
+
+def walk_files(directory):
+    for dirpath, dirs, files in os.walk(directory):
+        dirs[:] = sorted(d for d in dirs if d != ".git")
+        for name in sorted(files):
+            yield os.path.join(dirpath, name)
+
+
+def is_text(data):
+    if b"\0" in data:
+        return False
+    try:
+        data.decode("utf-8")
+    except UnicodeDecodeError:
+        return False
+    return True
+
+
+def file_items(path, strict):
+    """Lines of a text file. A binary or non-UTF-8 file is skipped, or with `strict` (private
+    mode, where the scanner cannot read it) refused: an unscanned file must not pass."""
+    if os.path.islink(path) or not os.path.isfile(path):
+        return []
+    with open(path, "rb") as f:
+        data = f.read()
+    if not is_text(data):
+        if strict:
+            raise PrivacyError(f"{path} is binary or not UTF-8, so it cannot be scanned; "
+                               "failing closed")
+        return []
+    return text_items(path, data.decode("utf-8"))
+
+
+def path_items(paths, strict=False):
+    items = []
+    for p in paths:
+        if os.path.isdir(p):
+            files = tracked_and_untracked(p)
+            for f in (files if files is not None else walk_files(p)):
+                items += file_items(f, strict)
+        elif os.path.exists(p):
+            items += file_items(p, strict)
+        else:
+            raise PrivacyError(f"no such file or directory: {p}")
+    return items
+
+
+def added_lines(sha):
+    """[(location, text)] added by one commit's patch (against each parent, for a merge)."""
+    # --text: a binary file or a `-diff` gitattribute must not hide its lines from the scan
+    patch = git("show", "-m", "--text", "--format=", "-U0", "--no-ext-diff", "--no-textconv", sha)
+    items, path, line = [], "?", 0
+    for raw in patch.splitlines():
+        if raw.startswith("+++ "):
+            path = raw[4:].removeprefix("b/")
+        elif raw.startswith("@@"):
+            m = re.search(r"\+(\d+)", raw)
+            line = int(m.group(1)) if m else 0
+        elif raw.startswith("+"):
+            items.append((f"{sha[:12]} {path}:{line}", raw[1:]))
+            line += 1
+        elif raw.startswith(" "):
+            line += 1
+    return items
+
+
+def changed_names(sha):
+    out = git("diff-tree", "--no-commit-id", "--name-only", "-r", "-m", "--root", "-z",
+              "--diff-filter=ACMRT", sha)
+    return [n for n in out.split("\0") if n]
+
+
+def require_text_blobs(sha, names):
+    """Private mode: the scanner reads text only, so a really binary file in the range fails
+    closed rather than passing unscanned."""
+    for name in names:
+        r = subprocess.run(["git", "cat-file", "blob", f"{sha}:{name}"], capture_output=True)
+        if r.returncode == 0 and not is_text(r.stdout):
+            raise PrivacyError(f"{sha[:12]} {name} is binary or not UTF-8, so it cannot be "
+                               "scanned; failing closed")
+
+
+def commit_items(sha, private):
+    s = sha[:12]
+    items = []
+    names = changed_names(sha)
+    items += [(f"{s} path-name#{i}", n) for i, n in enumerate(names, 1)]
+    if private:
+        require_text_blobs(sha, names)
+    for field, fmt in (("author-email", "%ae"), ("committer-email", "%ce")):
+        items.append((f"{s} {field}", git("show", "-s", f"--format={fmt}", sha).strip()))
+    message = git("show", "-s", "--format=%B", sha)
+    items += [(f"{s} {loc}", t) for loc, t in text_items("message", message)]
+    return items + added_lines(sha)
+
+
+def tag_chain(obj):
+    """([(tagger email, message)] for each tag object from `obj` down, final non-tag object)."""
+    chain = []
+    while True:
+        body = git("cat-file", "tag", obj)
+        head, _, message = body.partition("\n\n")
+        email, target, kind = "", None, None
+        for line in head.splitlines():
+            if line.startswith("tagger "):
+                m = re.search(r"<([^>]*)>", line)
+                email = m.group(1) if m else ""
+            elif line.startswith("object "):
+                target = line.split()[1]
+            elif line.startswith("type "):
+                kind = line.split()[1]
+        chain.append((email, message))
+        if kind != "tag" or not target:
+            return chain, target
+        obj = target
+
+
+def ref_items(commits):
+    items = []
+    fmt = "%(refname)%00%(objecttype)%00%(objectname)"
+    for row in git("for-each-ref", f"--format={fmt}").splitlines():
+        ref, kind, obj = row.split("\0")
+        chain, final = tag_chain(obj) if kind == "tag" else ([], obj)
+        if final not in commits:
+            continue
+        items.append((f"ref {ref}", ref))
+        for depth, (email, message) in enumerate(chain):
+            label = f"tag {ref}" + (f">{depth}" if depth else "")
+            items.append((f"{label} tagger-email", email))
+            items += [(f"{label} {loc}", t) for loc, t in text_items("message", message)]
+    return items
+
+
+def range_items(rng, private):
+    commits = git("rev-list", "--reverse", rng).split()
+    items = []
+    for sha in commits:
+        items += commit_items(sha, private)
+    return items + ref_items(set(commits))
+
+
+def load_denylist(home):
+    path = Path(home) / ".config/ai-workflow/privacy-denylist"
+    try:
+        lines = path.read_text().splitlines()
+    except OSError as e:
+        raise PrivacyError(f"cannot read the private denylist ({e.strerror}); failing closed")
+    terms = [t.strip().lower() for t in lines if t.strip() and not t.lstrip().startswith("#")]
+    if not terms:
+        raise PrivacyError("the private denylist is empty; failing closed")
+    return terms
+
+
+def default_allow_file(cwd):
+    try:
+        top = git("rev-parse", "--show-toplevel", cwd=cwd).strip()
+    except PrivacyError:
+        top = cwd
+    for rel in (".privacy-allow", "export/root/.privacy-allow"):
+        if os.path.isfile(os.path.join(top, rel)):
+            return os.path.join(top, rel)
+    return None
+
+
+def load_allowlist(path):
+    """[(line number, lowercase word)]; a malformed line is an error."""
+    if path is None:
+        return []
+    entries = []
+    try:
+        lines = Path(path).read_text().splitlines()
+    except OSError as e:
+        raise PrivacyError(f"cannot read the allowlist {path}: {e.strerror}")
+    for n, line in enumerate(lines, 1):
+        if not line.strip() or line.lstrip().startswith("#"):
+            continue
+        word, tab, reason = line.partition("\t")
+        if not (tab and ALLOW_WORD.match(word) and reason.strip()):
+            raise PrivacyError(f"{path}:{n}: expected `word<TAB>reason` with one exact word")
+        entries.append((n, word.lower()))
+    return entries
+
+
+def check_allow(allow_file, home):
+    terms = load_denylist(home)
+    bad = [n for n, word in load_allowlist(allow_file)
+           if any(word in t or t in word for t in terms)]
+    for n in bad:
+        print(f"allowlist line {n}: overlaps a denylist term")
+    return 1 if bad else 0
+
+
+def load_extra_scanner(home):
+    """The scanner path from ~/.config/ai-workflow/extra-scanner: a regular file holding one
+    absolute path to a regular file. Errors never print the path it holds."""
+    pointer = Path(home) / ".config/ai-workflow/extra-scanner"
+    bad = f"{pointer} must be a regular file holding one absolute path to the extra scanner; failing closed"
+    if pointer.is_symlink():
+        raise PrivacyError(bad)
+    try:
+        lines = pointer.read_text().splitlines()
+    except (OSError, UnicodeDecodeError):
+        raise PrivacyError(f"cannot read {pointer}; failing closed")
+    if len(lines) != 1 or not os.path.isabs(lines[0]) or not os.path.isfile(lines[0]):
+        raise PrivacyError(bad)
+    return Path(lines[0])
+
+
+def require_private(home):
+    if not shutil.which("gitleaks"):
+        raise PrivacyError("gitleaks is not on PATH; failing closed")
+    return load_extra_scanner(home), load_denylist(home)
+
+
+def scan_with_extra(scanner, items):
+    """({line text: [banned matches]}, {line text: [watch matches]}) from the scanner.
+    Each distinct line is its own file, so a hit maps back to the line."""
+    texts = sorted({t for _, t in items if t.strip()})
+    banned, watch = {}, {}
+    if not texts:
+        return banned, watch
+    with tempfile.TemporaryDirectory(prefix="privacy-check-") as d:
+        for i, t in enumerate(texts):
+            with open(os.path.join(d, f"{i}.txt"), "w", encoding="utf-8") as f:
+                f.write(t + "\n")
+        try:
+            r = subprocess.run([sys.executable, "-I", str(scanner), d], capture_output=True,
+                               text=True, errors="replace")
+        except OSError as e:
+            raise PrivacyError(f"cannot run the extra scanner: {e.strerror or type(e).__name__}")
+    parsed = 0
+    for row in r.stdout.splitlines():
+        m = BANNED_LINE.match(row)
+        if not m:
+            continue
+        kind, rel, match = m.groups()
+        try:
+            text = texts[int(rel.removesuffix(".txt"))]
+        except (ValueError, IndexError):
+            raise PrivacyError("the extra scanner printed a path this run did not create")
+        (banned if kind == "BANNED" else watch).setdefault(text, []).append(match)
+        parsed += 1
+    if r.returncode not in (0, 1) or (r.returncode == 1 and not parsed):
+        raise PrivacyError(f"the extra scanner failed (exit {r.returncode}); failing closed")
+    return banned, watch
+
+
+def run_checks(items, private, allow_file, home):
+    """Print findings; return True when any hit fails the run."""
+    failed = False
+    for loc, line in items:
+        for kind, match in generic_hits(line):
+            print(f"{loc}: {kind}: {match}")
+            failed = True
+    if not private:
+        return failed
+    scanner, terms = require_private(home)
+    allow = {w for _, w in load_allowlist(allow_file)}
+    for loc, line in items:
+        if any(t in line.lower() for t in terms):
+            print(f"{loc}: denylist term")
+            failed = True
+    banned, watch = scan_with_extra(scanner, items)
+    for loc, line in items:
+        if any(m.lower() not in allow for m in banned.get(line, [])):
+            print(f"{loc}: BANNED term")
+            failed = True
+        if line in watch:
+            print(f"{loc}: WATCH term (info)")
+    return failed
+
+
+def main(argv=None):
+    ap = argparse.ArgumentParser(prog="privacy-check", description=__doc__.split("\n\n")[0])
+    ap.add_argument("paths", nargs="*")
+    ap.add_argument("--stdin", action="store_true")
+    ap.add_argument("--range", dest="rng")
+    ap.add_argument("--private", action="store_true")
+    ap.add_argument("--check-allow", action="store_true")
+    ap.add_argument("--allow", metavar="FILE")
+    args = ap.parse_args(argv)
+    home = os.environ.get("HOME") or str(Path.home())
+    try:
+        allow_file = args.allow or default_allow_file(os.getcwd())
+        if args.check_allow:
+            return check_allow(allow_file, home)
+        if not (args.paths or args.stdin or args.rng):
+            raise PrivacyError("nothing to check: give PATH, --stdin or --range")
+        items = path_items(args.paths, strict=args.private)
+        if args.stdin:
+            items += text_items("<stdin>", sys.stdin.read())
+        if args.rng:
+            items += range_items(args.rng, args.private)
+        return 1 if run_checks(items, args.private, allow_file, home) else 0
+    except PrivacyError as e:
+        print(f"privacy-check: {e}", file=sys.stderr)
+        return 2
+    except Exception as e:  # fail closed on anything unforeseen
+        print(f"privacy-check: internal error: {type(e).__name__}: {e}", file=sys.stderr)
+        return 2
+
+
+if __name__ == "__main__":
+    sys.exit(main())

@@ -1,0 +1,20 @@
+// Minimal: the VSCode base keymap does the work, this adds only the three
+// test tasks.
+//
+// One chord root rather than three flat keys. cmd-alt-t is free in both
+// Zed's default-macos and VSCode keymaps; cmd-alt-l and cmd-alt-a are not —
+// they are already agent::ManageSkills and agent::OpenPermissionDropdown.
+//
+//   cmd-alt-t f   file
+//   cmd-alt-t l   line under the cursor
+//   cmd-alt-t a   all
+[
+  {
+    "context": "Workspace",
+    "bindings": {
+      "cmd-alt-t f": ["task::Spawn", { "task_name": "ruby: test file" }],
+      "cmd-alt-t l": ["task::Spawn", { "task_name": "ruby: test at cursor" }],
+      "cmd-alt-t a": ["task::Spawn", { "task_name": "ruby: full suite" }]
+    }
+  }
+]

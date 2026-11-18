@@ -1,0 +1,975 @@
+#!/usr/bin/env bash
+#
+# codex-audit — the single entry point for every Codex gate in the feature-workflow skill.
+#
+#   codex-audit 1b [--slug <slug>] [--round 1|2] [--response <file>]   # spec cross-check
+#   codex-audit 2b [--slug <slug>] [--round 1|2] [--response <file>]   # plan cross-check
+#   codex-audit 6b [--slug <slug>] [--response <file>]                 # diff vs spec (one-shot);
+#                                                                      # --response records the triage
+#   (each gate also takes --tier A|B --trigger <clause>, for the scorecard record only)
+#   codex-audit scorecard <ledger>   # read-only: a ledger's counts as key=value lines, for gate-log
+#
+# The skill calls this wrapper and never raw `codex exec`. Prompts live in codex/prompts/,
+# the reviewer contract in codex/reviewer-contract.md, and everything project-specific comes
+# from the profile (codex/lib/profile.sh). This file is L1: no project name, path, command,
+# language or domain appears in it.
+#
+# Design: docs/design/2026-09-cross-review-loop.md — §3 contract, §4 round protocol,
+# §4.4 ledger, §5 this interface.
+#
+# Exit codes:
+#   0  the gate ran and the ledger was written
+#   1  a real error: missing artifact, Codex missing or not authenticated, bad usage
+#   2  usage error
+#   3  the gate was SKIPPED and recorded as such in the ledger — the caller continues.
+#      Distinct from 0 on purpose: a skipped gate and a gate that ran and found nothing
+#      must never look the same to the caller or in the metrics.
+#   4  round 2 was requested but round 1 found no BLOCKER/MAJOR — nothing to verify.
+#      The caller treats this as success; it is the §4.2 early stop.
+#
+# `scorecard` runs no gate and has only two outcomes: 0 (the counts were printed, even when the
+# status line says the ledger is unrecordable) and 1 (no such file). It never exits 2, 3 or 4.
+
+set -euo pipefail
+
+readonly SELF_DIR="$(cd "$(dirname "$(readlink "${BASH_SOURCE[0]}" || echo "${BASH_SOURCE[0]}")")" && pwd)"
+readonly CODEX_HOME_REPO="$(cd "$SELF_DIR/.." && pwd)"
+readonly CONTRACT="$CODEX_HOME_REPO/reviewer-contract.md"
+readonly PROMPT_DIR="$CODEX_HOME_REPO/prompts"
+
+# shellcheck source=../lib/profile.sh
+source "$CODEX_HOME_REPO/lib/profile.sh"
+
+die()  { echo "codex-audit: $*" >&2; exit 1; }
+usage() {
+  cat >&2 <<'EOF'
+usage: codex-audit <1b|2b|6b> [--slug <slug>] [--pr <id>] [--tasks <ranges>]
+                    [--round 1|2] [--response <file>] [--tier A|B --trigger <clause>]
+
+  1b   critique the spec          (rounds 1-2)
+  2b   critique the plan          (rounds 1-2)
+  6b   diff vs spec, conformance  (round 1 only in Phase 1)
+
+  --slug <slug>      feature slug; defaults to the most recently modified spec
+  --round 1|2        review round (default 1). Round 2 requires --response
+  --response <file>  the response table answering round 1's findings. On 6b it is not
+                     sent anywhere: it is recorded in the ledger as the triage
+  --pr <id>          this PR's index in the plan's delivery table, when one spec ships
+                     across several PRs. Gives each PR its own ledger. Omit for a
+                     single-PR feature: the ledger path is then unchanged.
+  --tasks <ranges>   gate 6b only: the tasks THIS PR carries, from the same delivery-table
+                     row, e.g. 4-8,10,11. 6b then judges only the criteria those tasks
+                     name, instead of reporting work another PR has not built yet.
+                     ASCII hyphens: delivery tables are written with en dashes.
+  --tier A|B         the unit's tier, and with it --trigger: the feature-workflow clause
+  --trigger <clause> quoted to name it. Recorded in the gate scorecard, nowhere else.
+
+  codex-audit scorecard <ledger>   read-only: print one ledger's counts as key=value lines
+                                   (for gate-log; runs no gate, needs no repository)
+
+Run from anywhere inside the project repository or one of its worktrees.
+EOF
+  exit 2
+}
+note() { echo "» $*" >&2; }
+
+# Any argument that ends up as a path component is constrained to this shape. The wrapper is
+# allowlisted (`Bash(codex-audit:*)`), so every argument is reachable by an agent with no
+# permission prompt, and both --slug and --pr are concatenated into $LEDGER_DIR/... . Reject
+# rather than sanitise: a value that needs cleaning is a value the caller got wrong. Same
+# posture already applied to the thread id read back from a ledger, for the same
+# reason. `-` must not lead, or the value could be read as a flag downstream.
+readonly TOKEN_RE='^[A-Za-z0-9][A-Za-z0-9._-]*$'
+valid_token() { [[ "$1" =~ $TOKEN_RE ]]; }
+
+# A ledger that records a *skip* is not a review — it may be replaced freely. Only a ledger
+# carrying Codex's verbatim round-1 output is protected.
+ledger_holds_review() { [[ -f "$1" ]] && grep -q '^## Round 1' "$1"; }
+
+# Hands the finished gate to the scorecard (docs/design/2026-10-gate-scorecard.md). The wrapper
+# holds the counts but never assembles a record: gate_log.py reads the ledger back, so the
+# record format has one definition. The review is already paid for and written by the time this
+# runs, so a failure costs a warning and nothing else -- never the exit code, never the ledger.
+readonly REPO_ROOT="$(cd "$CODEX_HOME_REPO/.." && pwd)"
+record_scorecard() {
+  python3 "$REPO_ROOT/claude/skills/usage-audit/scripts/gate_log.py" add --ledger "$LEDGER" \
+    ${tier:+--tier "$tier"} ${trigger:+"--trigger=$trigger"} \
+    || note "WARNING: this gate was not recorded in the scorecard; the review itself is intact.
+  Re-record it with: gate-log add --ledger ${LEDGER/#$HOME/~}${tier:+ --tier $tier --trigger \"<clause>\"}"
+}
+
+# --- the gate lock ---------------------------------------------------------
+# Two gates on the same ledger must never overlap. Two overlapping runs on one ledger lost a
+# completed review; the lock prevents that.
+#
+# `mkdir` is the lock because macOS has no `flock`, and it is atomic on every filesystem that
+# matters here. The owner file identifies the holder well enough to tell "crashed" from
+# "still working": a bare pid would let a recycled pid block the gate forever.
+LOCK=""
+proc_start() { ps -o lstart= -p "$1" 2>/dev/null; }
+
+barrier_wait() {
+  # Test-only. Real runs never set these; the variable being unset is the whole guard.
+  local f="$1" i=0
+  [[ -n "$f" ]] || return 0
+  # Appends rather than truncates: a test synchronising N processes needs to know how many
+  # have arrived, not merely that one has.
+  echo "$$" >> "$f.reached"
+  while [[ -e "$f" ]]; do sleep 0.05; i=$((i + 1)); [[ $i -gt 400 ]] && break; done
+}
+
+lock_is_stale() {
+  local owner="$1/owner" pid host start
+  # No owner file yet means a process is BETWEEN its `mkdir` and its owner write, not that the
+  # lock is free. Reading that gap as "stale" reopens the whole hole from the inside: the
+  # reader breaks a live lock, and the ABA identity check waves it through because empty
+  # matches empty. Treat it as live -- but only until it goes cold, so a process that died in
+  # that gap cannot block the gate forever.
+  if [[ ! -f "$owner" ]]; then
+    find "$1" -maxdepth 0 -mmin +1 2>/dev/null | grep -q . && return 0
+    return 1
+  fi
+  pid="$(sed -n 1p "$owner")"; host="$(sed -n 2p "$owner")"; start="$(sed -n 3p "$owner")"
+  # Never break another machine's lock: a local pid says nothing about the holder. An external
+  # artifacts directory can be shared.
+  [[ "$host" == "$(hostname)" ]] || return 1
+  [[ -n "$start" ]] || return 0                       # no start time recorded: unverifiable
+  # The start time alone decides, and `kill -0` is deliberately not consulted: it cannot tell
+  # ESRCH from EPERM, so another user's live process on this same host reads as "gone" and its
+  # lock gets broken. `ps` is visible across users, so this comparison is both sufficient and
+  # correct -- a dead pid yields no start time, and a recycled one yields a different one.
+  [[ "$(proc_start "$pid")" == "$start" ]] && return 1 || return 0
+}
+
+lock_claim() {
+  mkdir "$1" 2>/dev/null || return 1
+  # A claim that cannot record its owner is not a claim. Without this the wrapper would set
+  # LOCK and report success for a lock it does not hold -- `lock_claim x && ...` suspends
+  # `set -e`, so a failed write here would otherwise pass silently.
+  if ! printf '%s\n%s\n%s\n' "$$" "$(hostname)" "$(proc_start $$)" > "$1/owner" 2>/dev/null; then
+    rm -rf "$1"
+    return 1
+  fi
+  LOCK="$1"
+}
+
+acquire_lock() {
+  local lock="$1" attempt=0 observed stale
+  lock_claim "$lock" && return 0
+  lock_is_stale "$lock" || return 1
+  # Called once, outside the retry loop: it records an arrival, and a test counting arrivals
+  # must not see the same process twice.
+  barrier_wait "${CODEX_AUDIT_TEST_BARRIER_STALE:-}"
+
+  # Breaking a stale lock cannot be done in one atomic step with only `mkdir` and `rename`, so
+  # it is done as a bounded retry instead. Two processes breaking the same stale lock will
+  # interleave -- one moves it aside while the other is mid-claim, or restores one it took by
+  # mistake -- and a single pass leaves BOTH losing and the lock orphaned. Retrying converts
+  # that into exactly one winner. Measured: 3 of 8 runs had two winners before the identity
+  # check, 2 of 8 had zero winners before this loop, 0 of 8 after.
+  while [[ $attempt -lt 5 ]]; do
+    attempt=$((attempt + 1))
+    lock_claim "$lock" && return 0            # freed in the meantime
+    observed="$(cat "$lock/owner" 2>/dev/null || true)"
+    lock_is_stale "$lock" || return 1         # genuinely live now: lose cleanly
+    stale="$lock.stale.$$"
+    if mv "$lock" "$stale" 2>/dev/null; then
+      # `mv` takes whatever occupies the path at that instant, which may already be a fresh
+      # lock claimed by whoever won the break. Compare identities before destroying it.
+      if [[ "$(cat "$stale/owner" 2>/dev/null || true)" == "$observed" ]]; then
+        rm -rf "$stale"
+        lock_claim "$lock" && return 0
+      else
+        mv "$stale" "$lock" 2>/dev/null || rm -rf "$stale"
+        return 1                              # we took a live lock: put it back and lose
+      fi
+    fi
+    sleep 0.05
+  done
+  return 1
+}
+
+cleanup() {
+  # Only ever remove a lock this process still owns. If another process broke ours and claimed
+  # its own, a blind `rm -rf` would delete a live lock and let a third process straight in.
+  if [[ -n "$LOCK" && "$(sed -n 1p "$LOCK/owner" 2>/dev/null)" == "$$" ]]; then
+    rm -rf "$LOCK"
+  fi
+  [[ -n "${TMP:-}" ]] && rm -rf "$TMP"
+  return 0
+}
+# INT/TERM must end the wrapper, not merely tidy up and let the script carry on running
+# without its lock.
+trap cleanup EXIT
+trap 'cleanup; exit 130' INT
+trap 'cleanup; exit 143' TERM
+
+# --- scorecard mode --------------------------------------------------------
+# `codex-audit scorecard <ledger>` is read-only: it prints one ledger's counts as key=value lines
+# for gate-log, and does nothing else -- no Codex, no profile, no lock, no write. This wrapper
+# writes the ledger format, so it is the only thing that reads it back; a second parser in
+# gate-log drifted from this one twice in review (design D9).
+#
+# Regions switch ONLY on the wrapper's own headings, matched exactly. The response file is
+# pasted into the ledger verbatim and Codex's text is free-form, so a prefix match would let a
+# heading inside either one move the counts. Within round 1 the severity sections are the
+# exception, matched by prefix exactly as count_findings does below.
+scorecard_dump() {
+  local file="${1:-}" base re
+  [[ -f "$file" ]] || die "scorecard: no such ledger: $file"
+  [[ -r "$file" ]] || die "scorecard: cannot read ledger: $file"
+  base="$(basename "$file")"
+  re='^(.+)-(1b|2b|6b)(-pr([0-9]+))?\.md(\.superseded-[A-Za-z0-9._-]+\.md)?$'
+  # An empty gate is how the caller tells "not a ledger" from a ledger that cannot be recorded.
+  # A control character in the name (a newline would forge a key=value line) is never a ledger.
+  if [[ "$base" == *[[:cntrl:]]* || ! "$base" =~ $re ]]; then
+    printf 'gate=\nstatus=unrecordable\n'; return 0
+  fi
+  # Through the environment, not `awk -v`: -v expands backslash escapes, and a file name is data.
+  SC_GATE="${BASH_REMATCH[2]}" SC_SLUG="${BASH_REMATCH[1]}" SC_PR="${BASH_REMATCH[4]}" awk '
+    function trim(s) { gsub(/^[ \t]+|[ \t]+$/, "", s); return s }
+    # A MINOR section that is one short "nothing here" bullet ("None.", "N/A — nothing to
+    # report") holds no finding. Anything longer or beside other bullets is counted, because a
+    # real finding can start with "No test covers ..." or "None of the callers ...".
+    function placeholder(s,   w, n, i, words) {
+      gsub(/[*_`]/, "", s); s = tolower(trim(s)); sub(/[ \t.,;:!?]+$/, "", s)
+      n = split(s, w, /[ \t]+/); words = 0
+      for (i = 1; i <= n; i++) if (w[i] ~ /[a-z0-9]/) words++
+      if (words > 4) return 0
+      return (s ~ /^none([^a-z0-9]|$)/ || s ~ /^nothing/ || s ~ /^n\/a/ || s ~ /^not applicable/ || s ~ /^no minor/)
+    }
+    BEGIN { gate = ENVIRON["SC_GATE"]; slug = ENVIRON["SC_SLUG"]; pr = ENVIRON["SC_PR"] }
+    $0 == "## Round 1 — Codex, verbatim"    { region = "r1"; seen = 1; sec = ""; next }
+    $0 == "## Response to round 1 — Claude" { region = "resp"; responded = 1; next }
+    $0 == "## Round 2 — Codex, verbatim"    { region = "r2"; next }
+    $0 == "## For the human" || $0 == "## Metrics" { region = "other"; next }
+    /^<!-- round [0-9]+ wall clock: [0-9]+s -->$/ && (region == "r1" || region == "r2") {
+      v = $0; sub(/^.*clock: /, "", v); sub(/s -->$/, "", v); wall += v
+    }
+    region == "" {
+      v = $0
+      if (v ~ /^- \*\*date:\*\*/)      { sub(/^- \*\*date:\*\* */, "", v); date = v }
+      else if (v ~ /^- \*\*rounds:\*\*/)  { sub(/^- \*\*rounds:\*\* */, "", v); rounds = v }
+      else if (v ~ /^- \*\*skipped:\*\*/) { skipped = 1 }
+      else if (v ~ /^- \*\*outcome:\*\* UNPARSEABLE/) { unparseable = 1 }
+      else if (v ~ /^<!-- thread_id: .* -->$/ && thread == "") {
+        sub(/^<!-- thread_id: /, "", v); sub(/ -->$/, "", v); v = trim(v)
+        if (v ~ /^[A-Za-z0-9][A-Za-z0-9._-]*$/) thread = v
+      }
+    }
+    region == "r1" {
+      if      ($0 ~ /^## +BLOCKER/) sec = "B"
+      else if ($0 ~ /^## +MAJOR/)   sec = "M"
+      else if ($0 ~ /^## +MINOR/)   sec = "m"
+      else if ($0 ~ /^## /)         sec = ""
+      else if ((sec == "B" || sec == "M") && $0 ~ ("^### +" gate "-F[0-9]+")) {
+        match($0, gate "-F[0-9]+"); sect[substr($0, RSTART, RLENGTH)] = sec; n[sec]++
+      } else if (sec == "m" && $0 ~ /^- /) {
+        if (++minors == 1) first_minor = substr($0, 3)
+      }
+    }
+    region == "r2" {
+      if ($0 ~ /^### +R[0-9]+/) {
+        v = $0; sub(/^### +/, "", v); match(v, /^R[0-9]+/); reg[substr(v, 1, RLENGTH)] = 1
+      } else if ($0 ~ /^[|] *R[0-9]+ *[|]/) {
+        split($0, f, "|"); reg[trim(f[2])] = 1
+      } else if ($0 ~ ("^[|] *" gate "-F[0-9]+ *[|]")) {
+        split($0, f, "|"); v = trim(f[5])
+        if (v == "maintain" || v == "not resolved") open[trim(f[2])] = 1
+      }
+    }
+    region == "resp" && $0 ~ ("^[|] *" gate "-F[0-9]+ *[|]") {
+      split($0, f, "|"); resp[trim(f[2])] = trim(f[4])
+      if (trim(f[4]) == "human") open[trim(f[2])] = 1
+    }
+    END {
+      for (id in resp) {
+        if (!(id in sect) || (id in open)) continue     # unknown to round 1, or still open
+        if (resp[id] == "accepted") acc[sect[id]]++
+        else if (resp[id] == "rejected") rej++
+      }
+      n["m"] = (minors == 1 && placeholder(first_minor)) ? 0 : minors
+      for (id in open) if (id in sect) human++
+      for (r in reg) { regressions++; human++ }
+      status = skipped ? "skip" : ((unparseable || !seen) ? "unrecordable" : "ok")
+      if (rounds == "") rounds = 1
+      printf "gate=%s\nslug=%s\npr=%s\ndate=%s\nthread=%s\nrounds=%s\nwall_s=%d\nskipped=%d\n",
+        gate, slug, pr, date, thread, rounds, wall, skipped
+      printf "status=%s\nblocker=%d\nmajor=%d\nminor=%d\nregressions=%d\n",
+        status, n["B"], n["M"], n["m"], regressions
+      printf "accepted_blocker=%d\naccepted_major=%d\nrejected=%d\nhuman=%d\nresponded=%d\n",
+        acc["B"], acc["M"], rej, human, responded
+    }
+  ' "$file"
+}
+
+# --- arguments -------------------------------------------------------------
+if [[ "${1:-}" == "scorecard" ]]; then
+  scorecard_dump "${2:-}"
+  exit 0
+fi
+gate=""; slug=""; round="1"; response_file=""; pr=""; rerun=""; tasks=""; tier=""; trigger=""
+[[ $# -gt 0 ]] || usage
+case "$1" in
+  1b|2b|6b) gate="$1"; shift ;;
+  diff)     gate="6b"; shift
+            note "'diff' is the old name for gate 6b — use '6b'." ;;
+  spec)     gate="1b"; shift
+            note "'spec' is the old name for gate 1b — use '1b'." ;;
+  plan)     gate="2b"; shift
+            note "'plan' is the old name for gate 2b — use '2b'." ;;
+  -h|--help) usage ;;
+  *)        usage ;;
+esac
+
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --slug)     slug="${2:-}";          [[ -n "$slug" ]]          || usage; shift 2 ;;
+    --round)    round="${2:-}";         [[ "$round" =~ ^[12]$ ]]  || usage; shift 2 ;;
+    --response) response_file="${2:-}"; [[ -n "$response_file" ]] || usage; shift 2 ;;
+    --pr)       pr="${2:-}";            [[ -n "$pr" ]]            || usage; shift 2 ;;
+    --tasks)    tasks="${2:-}";        [[ -n "$tasks" ]]         || usage; shift 2 ;;
+    --tier)     tier="${2:-}";          [[ "$tier" =~ ^[AB]$ ]]   || usage; shift 2 ;;
+    --trigger)  trigger="${2:-}";       [[ -n "$trigger" ]]       || usage; shift 2 ;;
+    --rerun)    rerun="1"; shift ;;
+    -h|--help)  usage ;;
+    *)          usage ;;
+  esac
+done
+
+# `--tasks` is spliced into instructions sent to another provider, through a command an agent
+# may run with no permission prompt. The grammar is deliberately narrow -- digits, ranges and
+# commas, nothing else -- and rejects rather than sanitises (SR1). It also forbids a zero, a
+# leading zero and an empty element, because each resolves to no criteria at all, and under the
+# silence rule a scope that resolves to nothing reads exactly like a diff that conforms (SR3).
+# The 4-digit cap is not cosmetic: the range check below evaluates in bash arithmetic, which
+# wraps at 64 bits, so `9223372036854775808-1` would overflow to a negative lower bound and be
+# accepted as ascending -- buying a real Codex run for a scope that resolves to nothing, which
+# is precisely what SR3 refuses to allow. Bounding the digits keeps arithmetic out of reach.
+readonly TASKS_RE='^[1-9][0-9]{0,3}(-[1-9][0-9]{0,3})?(,[1-9][0-9]{0,3}(-[1-9][0-9]{0,3})?)*$'
+if [[ -n "$tasks" ]]; then
+  [[ "$gate" == "6b" ]] || \
+    die "--tasks scopes a diff against the criteria a spec states, which only gate 6b does.
+    Gate $gate reviews an artifact rather than a diff, and has nothing to scope."
+  # Checked before the grammar so the common mistake gets the message that explains it, rather
+  # than a generic refusal. Delivery tables really are written with en dashes.
+  case "$tasks" in
+    *–*|*—*) die "invalid --tasks: that is an en dash, not a hyphen (got: $tasks).
+    Delivery tables are written with en dashes; --tasks takes ASCII hyphens. Pass 1-3 for 1–3." ;;
+  esac
+  [[ "$tasks" =~ $TASKS_RE ]] || \
+    die "invalid --tasks: task numbers and ranges only, e.g. 4-8,10,11 (got: $tasks).
+    It reaches the reviewer's instructions, so anything outside digits, '-' and ',' is refused."
+  # --rerun archives the ledger it replaces. Without --pr the scoped review would be archived
+  # over <slug>-6b.md -- the canonical path another PR's description links to -- so a scoped
+  # rerun must say which PR it belongs to. Plain runs need no such guard: a second one meets the
+  # overwrite guard and dies safely. Narrower than "--tasks always implies --pr", which would
+  # also forbid scoping a single-PR re-review to the tasks that changed.
+  [[ -z "$rerun" || -n "$pr" ]] || \
+    die "--tasks with --rerun needs --pr: the archive would replace the ledger at the unscoped
+    path, which another PR's description links to. Pass this PR's delivery-table index."
+  # ORDER IS LOAD-BEARING: this runs only after the grammar above accepted the value. `-le`
+  # evaluates its operands in arithmetic context, where bash expands array subscripts -- so a
+  # value like `a[$(cmd)]` would execute. The regex has already forbidden `[`, `$`, `(` and
+  # letters, which is the only reason this is safe. Never move this above the grammar check.
+  IFS=',' read -ra _task_ranges <<< "$tasks"
+  for _tr in "${_task_ranges[@]}"; do
+    case "$_tr" in
+      *-*) [[ "${_tr%%-*}" -le "${_tr##*-}" ]] || \
+             die "invalid --tasks: the range $_tr runs backwards (got: $tasks)." ;;
+    esac
+  done
+fi
+
+[[ -z "$pr" ]] || valid_token "$pr" || \
+  die "invalid --pr: must match [A-Za-z0-9][A-Za-z0-9._-]* (got: $pr).
+    It becomes part of the ledger filename, so a path separator or a leading dash is refused."
+
+# The unit's tier and the feature-workflow clause quoted to name it go to the scorecard only, so
+# a misclassification can be audited later. Checked here, before Codex is paid for: gate_log.py
+# applies the same rule, and a record it refused would cost the scorecard this run. Optional, so
+# a session still holding the old skill text keeps working; the record then has no tier.
+if [[ -n "$tier$trigger" ]]; then
+  [[ -n "$tier" && -n "$trigger" ]] || \
+    { echo "codex-audit: --tier and --trigger go together: quote the clause that names the tier" >&2; exit 2; }
+  [[ ${#trigger} -le 300 && ! "$trigger" =~ [[:cntrl:]] ]] || \
+    { echo "codex-audit: invalid --trigger: one line of at most 300 characters" >&2; exit 2; }
+else
+  note "no --tier/--trigger: this gate's scorecard record will carry no tier."
+fi
+
+[[ "$gate" == "6b" && "$round" == "2" ]] && \
+  die "gate 6b is one-shot in Phase 1 — round 2 arrives with the Phase 2 rollout"
+
+# --- preflight -------------------------------------------------------------
+command -v codex >/dev/null 2>&1 || die "the Codex CLI is not installed or not on PATH"
+command -v jq    >/dev/null 2>&1 || die "jq is required to read Codex's --json output"
+git rev-parse --git-dir >/dev/null 2>&1 || \
+  die "not inside a git repository — Codex requires a trusted git directory"
+
+# Assigned before being made readonly: `readonly X="$(cmd)"` returns the status of `readonly`,
+# not of the substitution, so a `|| die` there never fires and an empty ARTIFACTS would build
+# paths at the filesystem root.
+ARTIFACTS="$(profile_artifacts_dir)" || die "could not resolve the artifacts directory"
+[[ -n "$ARTIFACTS" ]] || die "could not resolve the artifacts directory — is this a git repo?"
+readonly ARTIFACTS
+# Ledgers live in the git common dir, never in the tracked tree: they are the gate's working
+# state (lock, anti-re-run refusal, round-2 resume), not a document anyone re-reads. The common
+# dir is shared by every worktree, so the lock still spans them. Only the verdict reaches the spec.
+GIT_COMMON="$(git rev-parse --path-format=absolute --git-common-dir)" || \
+  die "could not resolve the git common directory"
+readonly LEDGER_DIR="$GIT_COMMON/codex-audit"
+readonly LEGACY_LEDGER_DIR="$ARTIFACTS/reviews"
+readonly PLAN_DIR="$ARTIFACTS/plans"
+readonly PROFILE_FILE="$(profile_path || echo "")"
+
+# Resolve the slug from the most recently modified spec when it wasn't given.
+if [[ -z "$slug" ]]; then
+  # "Most recently modified" is only a safe guess while the artifacts directory belongs to
+  # one line of work. An external directory is shared by every worktree of the repository, so
+  # the newest spec there can easily be another branch's feature — and the gate would review
+  # it and write that feature's ledger. Make the caller say which.
+  if profile_is_external; then
+    die "artifacts are external ($ARTIFACTS), shared by every worktree of this repository.
+    Pass --slug explicitly: the most recently modified spec may belong to another branch."
+  fi
+  [[ -d "$ARTIFACTS" ]] || die "no artifacts directory at $ARTIFACTS — pass --slug, or create the spec first"
+  newest="$(ls -t "$ARTIFACTS"/*.md 2>/dev/null | grep -v '_template' | head -1 || true)"
+  [[ -n "$newest" ]] || die "no spec files in $ARTIFACTS — pass --slug, or create the spec first"
+  slug="$(basename "$newest" .md)"
+  note "slug not given; using the most recent spec: $slug"
+fi
+
+valid_token "$slug" || \
+  die "invalid --slug: must match [A-Za-z0-9][A-Za-z0-9._-]* (got: $slug).
+    It becomes part of the spec and ledger paths, so a path separator or a leading dash is refused."
+
+readonly SPEC_PATH="$ARTIFACTS/$slug.md"
+readonly PLAN_PATH="$PLAN_DIR/$slug.md"
+# One base name feeds the ledger and its raw-events sibling. They used to be built
+# independently, which is how they could drift: a spec delivered across several PRs gave both
+# the same path twice and the second run silently replaced the first. `--pr` is the PR's index
+# in the plan's delivery table — an identity that exists before the PR is opened, which a
+# GitHub PR number does not, because gate 6b runs before `gh pr create`.
+readonly LEDGER_BASE="$LEDGER_DIR/$slug-$gate${pr:+-pr$pr}"
+readonly LEDGER="$LEDGER_BASE.md"
+
+# A review the old wrapper wrote under the artifacts dir would otherwise be invisible here:
+# round 1 would redo a finished gate and round 2 would find nothing to resume.
+# A legacy skip record is not a review and never blocks. The command copies rather than moves:
+# the old file may be tracked, and deleting committed ledgers belongs to its own PR.
+legacy="$LEGACY_LEDGER_DIR/$(basename "$LEDGER")"
+if [[ ! -f "$LEDGER" ]] && ledger_holds_review "$legacy"; then
+  die "this ledger is still at its old location. Copy it, then re-run:
+    mkdir -p $(printf %q "$LEDGER_DIR") && cp $(printf %q "$legacy") $(printf %q "$LEDGER")"
+fi
+
+# Taken here, before consent, gate and login checks: every one of those can call
+# `record_skip`, which writes this same ledger. The lock is keyed on the resolved path, so two
+# genuinely different ledgers never contend.
+mkdir -p "$LEDGER_DIR"
+acquire_lock "$LEDGER_DIR/.$(basename "$LEDGER_BASE").lock" || \
+  die "a gate is already running for this ledger — refusing to run a second one.
+    ledger: ${LEDGER/#$HOME/~}
+    Wait for it to finish. Two gates on one ledger means one of the two reviews is lost."
+
+[[ -f "$SPEC_PATH" ]] || die "spec not found: $SPEC_PATH"
+[[ "$gate" == "2b" && ! -f "$PLAN_PATH" ]] && \
+  die "plan not found: $PLAN_PATH — write the plan to a file before gate 2b (design §4.5)"
+# Without the plan the task numbers resolve to nothing, and D1's silence would turn that into a
+# review that reports nothing and reads as clean. Refuse instead, before the spend.
+[[ -n "$tasks" && ! -f "$PLAN_PATH" ]] && \
+  die "plan not found: $PLAN_PATH — --tasks names tasks that only the plan numbers.
+    Without it the scope cannot be resolved, and an unresolvable scope is not a clean review."
+
+case "$gate" in
+  1b|6b) ARTIFACT_PATH="$SPEC_PATH" ;;
+  2b)    ARTIFACT_PATH="$PLAN_PATH" ;;
+esac
+readonly ARTIFACT_PATH
+
+# Every round-1 BLOCKER/MAJOR must get exactly one response. An id missing from the table
+# is never classified in round 2 and never reaches the "For the human" section — the
+# finding would simply vanish, which is the one outcome the ledger exists to prevent.
+# Every one of these greps legitimately matches nothing (an empty response table, a table
+# written as a list, no duplicates at all). Under `set -e` with `pipefail` a no-match would
+# abort the script right here — exit 1, no output — and the skill tells the caller that
+# exit 1 means "a real failure, read the message". There would be no message. Let them
+# come back empty and have the checks below do the reporting.
+check_response_ids() {
+  local ledger_ids response_ids missing unknown dupes
+  ledger_ids="$(grep -oE "^### +$gate-F[0-9]+" "$LEDGER" | grep -oE "$gate-F[0-9]+" | sort -u || true)"
+  response_ids="$(grep -oE "$gate-F[0-9]+" "$response_file" | sort -u || true)"
+  missing="$(comm -23 <(echo "$ledger_ids") <(echo "$response_ids"))"
+  unknown="$(comm -13 <(echo "$ledger_ids") <(echo "$response_ids"))"
+  dupes="$(grep -oE "^\| *$gate-F[0-9]+" "$response_file" | grep -oE "$gate-F[0-9]+" \
+           | sort | uniq -d || true)"
+  [[ -z "$missing" ]] || die "the response table does not answer every round-1 finding.
+    Unanswered: $(echo "$missing" | tr '\n' ' ')
+    Each BLOCKER/MAJOR needs exactly one of: accepted / rejected / human."
+  [[ -z "$unknown" ]] || die "the response table answers findings that round 1 never raised:
+    $(echo "$unknown" | tr '\n' ' ')"
+  [[ -z "$dupes" ]] || die "the response table answers these findings more than once:
+    $(echo "$dupes" | tr '\n' ' ')"
+}
+
+# --- 6b triage record ------------------------------------------------------
+# 6b is one-shot, so no round 2 ever carries a response table and the scorecard could never say
+# what was accepted. `6b --response` appends Claude's triage of the round-1 findings to the ledger
+# and records it again, with no Codex call: nothing leaves the machine, so neither consent nor a
+# login is checked. The scorecard keeps the last record per ledger and thread, so this one
+# supersedes the untriaged record.
+if [[ "$gate" == "6b" && -n "$response_file" ]]; then
+  # This record supersedes round 1's, so one without a tier would drop the unit from its tier.
+  [[ -n "$tier" ]] || die "a 6b triage replaces round 1's scorecard record: pass the same
+    --tier and --trigger round 1 ran with."
+  [[ -f "$response_file" ]] || die "response file not found: $response_file"
+  ledger_holds_review "$LEDGER" || die "no 6b review at ${LEDGER/#$HOME/~} — run the gate first"
+  grep -q '^- \*\*outcome:\*\* UNPARSEABLE' "$LEDGER" && \
+    die "this 6b review is UNPARSEABLE: it has no findings to triage. Read the ledger yourself."
+  grep -qx '## Response to round 1 — Claude' "$LEDGER" && \
+    die "this ledger already holds a triage — refusing to record a second one.
+    ledger: ${LEDGER/#$HOME/~}"
+  if grep -q '^- \*\*outcome:\*\* no BLOCKER/MAJOR' "$LEDGER"; then
+    note "6b found no BLOCKER/MAJOR — nothing to triage"
+    exit 4
+  fi
+  check_response_ids
+  # Round 2 tolerates a looser table because Codex reads it; here only the scorecard does, and
+  # it counts table rows alone. So every finding needs its own row, with a status it counts:
+  # an id named only in another row's reason, or a `deferred`, would vanish from the record.
+  rowed="$(grep -oE "^\| *$gate-F[0-9]+" "$response_file" | grep -oE "$gate-F[0-9]+" | sort -u || true)"
+  unrowed="$(grep -oE "^### +$gate-F[0-9]+" "$LEDGER" | grep -oE "$gate-F[0-9]+" | sort -u \
+             | comm -23 - <(echo "$rowed") || true)"
+  [[ -z "$unrowed" ]] || die "these findings have no row of their own in the response table:
+    $(echo "$unrowed" | tr '\n' ' ')"
+  badstatus="$(awk -F'|' -v g="$gate" '$0 ~ ("^[|] *" g "-F[0-9]+ *[|]") {
+      id = $2; s = $4; gsub(/^[ \t]+|[ \t]+$/, "", id); gsub(/^[ \t]+|[ \t]+$/, "", s)
+      if (s != "accepted" && s != "rejected" && s != "human") printf "%s (%s) ", id, s
+    }' "$response_file")"
+  [[ -z "$badstatus" ]] || die "status must be accepted, rejected or human: $badstatus"
+  { echo; echo "## Response to round 1 — Claude"; echo; cat "$response_file"; } >> "$LEDGER"
+  note "triage recorded: ${LEDGER/#$HOME/~}"
+  record_scorecard
+  exit 0
+fi
+
+# --- degradation (design §7, decided in §13) -------------------------------
+# A disabled or unavailable reviewer records `skipped` and returns 3; it never blocks.
+record_skip() {
+  local reason="$1"
+  mkdir -p "$LEDGER_DIR"
+  # Never overwrite a ledger that holds a real review. A login that expired, or the profile
+  # flipped to `codex_reviewer: no`, would otherwise replace Codex's verbatim critique with
+  # "This gate did not run." The ledger is the only copy of that critique.
+  if ledger_holds_review "$LEDGER"; then
+    note "gate $gate would be skipped ($reason), but $LEDGER already holds a review."
+    note "Leaving it untouched. Delete it first if you really want to re-run this gate."
+    exit 3
+  fi
+  {
+    echo "# Gate $gate — $slug"
+    echo
+    echo "- **skipped:** $reason"
+    echo "- **date:** $(date '+%Y-%m-%d %H:%M')"
+    echo "- **artifact:** \`${ARTIFACT_PATH/#$HOME/~}\`"
+    echo "- **profile:** ${PROFILE_FILE:-(none — defaults)}"
+    echo
+    echo "This gate did not run. It is recorded so it cannot be mistaken for a gate that ran"
+    echo "and found nothing."
+  } > "$LEDGER"
+  note "gate $gate SKIPPED: $reason"
+  note "ledger: ${LEDGER/#$HOME/~}"
+  # Only here, after the skip ledger is written. The early exit 3 above leaves a real review
+  # in place, and recording a skip for it would supersede that review in the scorecard.
+  record_scorecard
+  exit 3
+}
+
+case "$(profile_codex_consent)" in
+  no) record_skip "reviewer disabled by profile (codex_reviewer: no)" ;;
+  unset)
+    # Not a decision — nobody has made one. Reviewing first and asking afterwards would have
+    # already sent this repository's artifact to another provider.
+    note "no profile authorizes sending this repository's artifacts to Codex."
+    note "to allow it, add to ${PROFILE_FILE:-docs/ai-profile.md}:  codex_reviewer: yes"
+    note "template: $CODEX_HOME_REPO/profile.template.md"
+    record_skip "outbound review not authorized for this repository (codex_reviewer is unset)"
+    ;;
+esac
+
+# An out-of-repo profile is addressed by a basename, which is not unique across clients.
+if profile_is_out_of_repo; then
+  declared="$(profile_get repo_identity "")"
+  actual="$(profile_repo_identity)"
+  # A path identity is compared physically, so the /var vs /private/var spelling of the same
+  # directory does not read as two different repositories.
+  [[ "$declared" == /* ]] && declared="$(profile_canon_path "$declared")"
+  [[ -n "$declared" ]] || die "the out-of-repo profile $PROFILE_FILE has no 'repo_identity'.
+    It is addressed by directory basename, which two unrelated repositories can share.
+    Add:  repo_identity: $actual"
+  [[ "$declared" == "$actual" ]] || die "profile/repository mismatch — refusing to run.
+    $PROFILE_FILE declares repo_identity: $declared
+    but this repository is:                $actual
+    Two repositories share a directory basename. Rename one, or split the profiles."
+fi
+
+profile_gate_enabled "$gate" || record_skip "gate $gate not enabled by profile"
+codex login status >/dev/null 2>&1 || record_skip "Codex is not authenticated (run: codex login)"
+
+# --- the overwrite guard ---------------------------------------------------
+# This runs BEFORE the prompt is assembled and before `codex exec`, which is the whole point:
+# discovering the collision at write time would mean paying for a review only to throw it away.
+# `record_skip` has refused to clobber a real review since the wrapper was written; the round-1
+# path never did, and that asymmetry is what let a second gate destroy a paid-for critique.
+if [[ "$round" == "1" && -z "$rerun" ]] && ledger_holds_review "$LEDGER"; then
+  existing_rev="$(sed -n 's/^- \*\*artifact revision:\*\* //p'  "$LEDGER" | head -1)"
+  existing_date="$(sed -n 's/^- \*\*date:\*\* //p' "$LEDGER" | head -1)"
+  # Deliberately names no flag. An agent that hits this reads the message; if the message
+  # offered the escape hatch, the guard would be teaching the bypass to the caller it exists
+  # to stop. Deleting the ledger is a separate, un-allowlisted act that prompts the human.
+  die "this ledger already holds a round-1 review — refusing to replace it.
+    ledger:            ${LEDGER/#$HOME/~}
+    artifact revision: ${existing_rev:-unknown}
+    date:              ${existing_date:-unknown}
+    A completed review is never overwritten. If it is stale, delete the ledger yourself."
+fi
+
+# --- prompt assembly -------------------------------------------------------
+readonly TMP="$(mktemp -d)"
+
+# Drop the leading HTML comment block: it documents the template for a human reading the
+# repo and is noise in the prompt.
+strip_comments() {
+  awk '/<!--/ { inc = 1 } !inc { print } /-->/ { inc = 0 }' "$1"
+}
+
+# splice <template> <placeholder> <file-whose-contents-replace-it>
+splice() {
+  awk -v ph="$2" -v cf="$3" '
+    index($0, ph) { while ((getline line < cf) > 0) print line; close(cf); next }
+    { print }
+  ' "$1"
+}
+
+# subst <template> — replace the single-line path placeholders, literally (no regex).
+subst() {
+  awk -v gate="$gate" -v spec="$SPEC_PATH" -v plan="$PLAN_PATH" -v art="$ARTIFACT_PATH" \
+      -v tasks="$tasks" '
+    function rep(s, ph, v,   i) {
+      while ((i = index(s, ph)) > 0) s = substr(s, 1, i - 1) v substr(s, i + length(ph))
+      return s
+    }
+    {
+      $0 = rep($0, "{{GATE}}", gate)
+      $0 = rep($0, "{{SPEC_PATH}}", spec)
+      $0 = rep($0, "{{PLAN_PATH}}", plan)
+      $0 = rep($0, "{{ARTIFACT_PATH}}", art)
+      $0 = rep($0, "{{TASKS}}", tasks)
+      print
+    }
+  ' "$1"
+}
+
+profile_calibration > "$TMP/calibration.md"
+
+strip_comments "$CONTRACT" > "$TMP/contract.raw"
+splice "$TMP/contract.raw" "{{CALIBRATION}}" "$TMP/calibration.md" > "$TMP/contract.spliced"
+subst "$TMP/contract.spliced" > "$TMP/prompt.md"
+
+echo >> "$TMP/prompt.md"
+
+if [[ "$round" == "1" ]]; then
+  # The scoped instructions live in their own fragment so that an unscoped prompt keeps not one
+  # byte of them: splicing an empty file drops the placeholder line outright. A static block
+  # inside 6b.md would change every single-PR review ever run.
+  if [[ -n "$tasks" ]]; then
+    strip_comments "$PROMPT_DIR/$gate.scope.md" > "$TMP/scope.md"
+  else
+    : > "$TMP/scope.md"
+  fi
+  strip_comments "$PROMPT_DIR/$gate.md" > "$TMP/gate.raw"
+  splice "$TMP/gate.raw" "{{TASKS_SCOPE}}" "$TMP/scope.md" | subst /dev/stdin >> "$TMP/prompt.md"
+else
+  [[ -n "$response_file" ]] || die "--round 2 requires --response <file>"
+  [[ -f "$response_file" ]] || die "response file not found: $response_file"
+  strip_comments "$PROMPT_DIR/round2.md" > "$TMP/r2.raw"
+  splice "$TMP/r2.raw" "{{RESPONSE_TABLE}}" "$response_file" > "$TMP/r2.spliced"
+  subst "$TMP/r2.spliced" >> "$TMP/prompt.md"
+fi
+
+# --- round 2 preconditions -------------------------------------------------
+# The thread id and the cwd of round 1 are kept in the ledger. `codex exec resume` has no
+# --cd and filters recorded sessions by cwd, so round 2 must run where round 1 ran.
+thread_id=""
+if [[ "$round" == "2" ]]; then
+  [[ -f "$LEDGER" ]] || die "no round-1 ledger at $LEDGER — run round 1 first"
+  if grep -q '^- \*\*outcome:\*\* no BLOCKER/MAJOR' "$LEDGER"; then
+    note "round 1 found no BLOCKER/MAJOR — skipping round 2 (design §4.2 early stop)"
+    note "ledger: ${LEDGER/#$HOME/~}"
+    record_scorecard
+    exit 4
+  fi
+  check_response_ids
+
+  thread_id="$(sed -n 's/^<!-- thread_id: \(.*\) -->$/\1/p' "$LEDGER" | head -1)"
+  round1_cwd="$(sed -n 's/^<!-- cwd: \(.*\) -->$/\1/p' "$LEDGER" | head -1)"
+  [[ -n "$thread_id" ]] || die "no thread id recorded in $LEDGER — cannot resume round 1"
+  # The ledger is a committed artifact, so this value can arrive from a repository rather
+  # than from us. It becomes the first argv element of `codex exec resume`, where anything
+  # starting with `-` is parsed as a FLAG, not a session id — and resume accepts
+  # --dangerously-bypass-approvals-and-sandbox. Since the wrapper is allowlisted, nothing
+  # would prompt. Constrain it to what a session id or thread name can actually look like.
+  [[ "$thread_id" =~ ^[A-Za-z0-9][A-Za-z0-9._-]*$ ]] || \
+    die "refusing to resume: the thread id recorded in $LEDGER is not a valid session id.
+    Found: $thread_id
+    A ledger is a committed file; a crafted value here becomes a command-line flag."
+  if [[ -n "$round1_cwd" && "$round1_cwd" != "$PWD" ]]; then
+    die "round 1 ran in $round1_cwd; 'codex exec resume' filters by cwd and has no --cd.
+    Re-run from there, or start a fresh round 1 here."
+  fi
+fi
+
+# --- run -------------------------------------------------------------------
+mkdir -p "$LEDGER_DIR"
+started="$(date +%s)"
+note "gate $gate round $round → ${ARTIFACT_PATH/#$HOME/~}"
+note "profile: ${PROFILE_FILE:-(none — defaults)}"
+
+# stdin is redirected from /dev/null explicitly: `codex exec` reads stdin whenever it is not
+# a TTY, and it never is when an agent drives this wrapper through a Bash tool.
+set +e
+if [[ "$round" == "1" ]]; then
+  codex exec -p audit --json \
+    -o "$TMP/message.md" \
+    "$(cat "$TMP/prompt.md")" \
+    > "$TMP/events.jsonl" 2>"$TMP/stderr.log" < /dev/null
+  codex_status=$?
+else
+  # `resume` accepts no --profile: the audit profile's guarantees are re-applied by hand, or
+  # the base config's approval_policy ("on-request") would silently apply and the gate could
+  # stall waiting for an approval no one is there to give.
+  codex exec resume --json \
+    -c sandbox_mode="read-only" \
+    -c approval_policy="never" \
+    -o "$TMP/message.md" \
+    -- "$thread_id" "$(cat "$TMP/prompt.md")" \
+    > "$TMP/events.jsonl" 2>"$TMP/stderr.log" < /dev/null
+  codex_status=$?
+fi
+set -e
+elapsed=$(( $(date +%s) - started ))
+# Test-only: lets a test hold a process in the post-Codex, pre-write window. A stub that
+# blocked instead would prove nothing -- a blocked stub means `codex exec` never returned.
+barrier_wait "${CODEX_AUDIT_TEST_BARRIER_POSTRUN:-}"
+
+if [[ "$codex_status" -ne 0 ]]; then
+  echo "codex-audit: codex exited $codex_status" >&2
+  tail -20 "$TMP/stderr.log" >&2 || true
+  exit 1
+fi
+if [[ ! -s "$TMP/message.md" ]]; then
+  # Keep the evidence: the EXIT trap is about to delete $TMP, so pointing at a file in there
+  # would send the reader to something that no longer exists.
+  mkdir -p "$LEDGER_DIR"
+  cp "$TMP/events.jsonl" "$LEDGER_BASE.events.jsonl" 2>/dev/null || true
+  die "Codex returned an empty review — raw events kept at $LEDGER_BASE.events.jsonl"
+fi
+
+# `|| true` matters here: the review has already been paid for at this point. If codex wrote
+# any non-JSON line to stdout, jq exits non-zero, pipefail propagates, and `set -e` would end
+# the script BEFORE the ledger is written — while the EXIT trap deletes $TMP and the review
+# with it. A missing thread id costs round 2; losing the critique costs the whole gate.
+new_thread="$(jq -r 'select(.type == "thread.started") | .thread_id' "$TMP/events.jsonl" 2>/dev/null | head -1 || true)"
+[[ -n "$new_thread" && "$new_thread" != "null" ]] || new_thread="$thread_id"
+
+# --- findings count (drives the §4.2 early stop) ---------------------------
+count_findings() {
+  awk -v gate="$gate" '
+    /^## +BLOCKER/ { sec = "B"; next }
+    /^## +MAJOR/   { sec = "M"; next }
+    /^## +MINOR/   { sec = "";  next }
+    /^## +DROPPED/ { sec = "";  next }
+    /^## /         { sec = "";  next }
+    sec != "" && $0 ~ ("^### +" gate "-F[0-9]+") { n[sec]++ }
+    END { printf "%d %d", n["B"] + 0, n["M"] + 0 }
+  ' "$1"
+}
+read -r blockers majors <<< "$(count_findings "$TMP/message.md")"
+
+# A review with no BLOCKER/MAJOR and a review we failed to PARSE both count zero, and the
+# early stop would treat either as "nothing found". They are opposites. The contract requires
+# the `## BLOCKER` and `## MAJOR` headings even when empty, so their absence means the output
+# did not follow the format and the count means nothing. Say so instead of recording a pass.
+parseable=1
+grep -qE '^## +BLOCKER' "$TMP/message.md" || parseable=0
+grep -qE '^## +MAJOR'   "$TMP/message.md" || parseable=0
+if [[ "$parseable" -eq 0 ]]; then
+  note "WARNING: Codex's output does not follow the contract's format (no BLOCKER/MAJOR"
+  note "headings). The finding count cannot be trusted, so this gate is NOT recorded as"
+  note "clean. Read the ledger yourself and decide."
+fi
+
+# --- ledger ----------------------------------------------------------------
+# `--rerun` archives the review it replaces; it never destroys one. That is what keeps the
+# flag from being a data-loss vector: a permission rule can gate the destructive form, but the
+# permissions doc is explicit that a Bash rule "isn't a security boundary around the program",
+# so a reordered command line escapes it. Removing the destruction removes the threat instead.
+#
+# It happens HERE, not at the guard, and the placement is the point: everything that can fail
+# -- a non-zero codex, an empty review -- has already exited above. Archiving any earlier would
+# leave the canonical path empty whenever Codex failed, and specs and PR descriptions link to
+# that path.
+if [[ "$round" == "1" && -n "$rerun" ]] && ledger_holds_review "$LEDGER"; then
+  # The clock is injectable so a test can force two archives into the same tick. Real runs
+  # never set it.
+  stamp="${CODEX_AUDIT_TEST_CLOCK:-$(date -u +%Y%m%dT%H%M%SZ)}"
+  archive="$LEDGER.superseded-$stamp.md"
+  n=2
+  while [[ -e "$archive" ]]; do
+    archive="$LEDGER.superseded-$stamp-$n.md"; n=$((n + 1))
+  done
+  # Everything else after `codex exec` returns is guarded, because the review has already been
+  # paid for by this point. This `mv` was the exception: a failure here exits 1, the EXIT trap
+  # deletes $TMP, and the only copy of the new review goes with it. Overwriting the old ledger
+  # anyway is not the answer either -- that is the data loss this whole change exists to stop.
+  # So: keep the new review beside the ledger and say where it is.
+  if ! mv "$LEDGER" "$archive" 2>/dev/null; then
+    pending="$LEDGER_BASE.pending-$stamp.md"
+    mkdir -p "$(dirname "$pending")" 2>/dev/null || pending="$LEDGER_DIR/pending-review.md"
+    cp "$TMP/message.md" "$pending" 2>/dev/null || true
+    die "could not archive the existing ledger, so it was left untouched.
+    existing ledger:  ${LEDGER/#$HOME/~}
+    the NEW review:   ${pending/#$HOME/~}
+    Nothing was lost. Reconcile the two by hand."
+  fi
+  note "previous review archived: ${archive/#$HOME/~}"
+fi
+
+if [[ "$round" == "1" ]]; then
+  {
+    echo "# Gate $gate — $slug"
+    echo
+    echo "<!-- thread_id: $new_thread -->"
+    echo "<!-- cwd: $PWD -->"
+    echo
+    echo "- **artifact:** \`${ARTIFACT_PATH/#$HOME/~}\`"
+    echo "- **artifact revision:** \`$(git rev-parse --short HEAD 2>/dev/null || echo 'no commit')\`$(git diff --quiet 2>/dev/null || echo ' + uncommitted changes')"
+    echo "- **date:** $(date '+%Y-%m-%d %H:%M')"
+    # A scoped review that does not say so will later be read as full coverage (SR4).
+    [[ -n "$tasks" ]] && echo "- **scope:** tasks $tasks — criteria outside them were not judged"
+    echo "- **reviewer:** codex \`$(codex --version 2>/dev/null | head -1)\`, profile \`audit\`"
+    echo "- **profile:** ${PROFILE_FILE:-(none — defaults)}"
+    echo "- **rounds:** 1"
+    if [[ "$parseable" -eq 0 ]]; then
+      echo "- **outcome:** UNPARSEABLE — the output does not follow the contract's format, so"
+      echo "  the finding count is meaningless. Not recorded as clean; read it yourself."
+    elif [[ "$((blockers + majors))" -eq 0 ]]; then
+      echo "- **outcome:** no BLOCKER/MAJOR — round 2 not required (design §4.2)"
+    fi
+    echo
+    echo "## Round 1 — Codex, verbatim"
+    echo
+    cat "$TMP/message.md"
+    echo
+    echo "<!-- round 1 wall clock: ${elapsed}s -->"
+  } > "$LEDGER"
+else
+  {
+    echo
+    echo "## Response to round 1 — Claude"
+    echo
+    cat "$response_file"
+    echo
+    echo "## Round 2 — Codex, verbatim"
+    echo
+    cat "$TMP/message.md"
+    echo
+    echo "<!-- round 2 wall clock: ${elapsed}s -->"
+  } >> "$LEDGER"
+
+  # --- §4.4 item 5: for the human --------------------------------------------
+  # The whole point of the loop is that the human's checkpoint shrinks to the disputes. That
+  # only works if the disputes are collected in one place: a maintained finding, a fix Codex
+  # says did not land, a regression the fixes introduced, or a call that was never the
+  # models' to make. Anything listed here is open — the gate has not closed it.
+  awk -v gate="$gate" '
+    /^\| *'"$gate"'-F[0-9]+ *\|/ {
+      n = split($0, f, "|")
+      for (i = 1; i <= n; i++) gsub(/^[ \t]+|[ \t]+$/, "", f[i])
+      id = f[2]; sev = f[3]; resp = f[4]; verdict = f[5]; note = f[6]
+      if (verdict == "maintain")      print "| " id " | " sev " | Codex maintains it | " note
+      else if (verdict == "not resolved") print "| " id " | " sev " | fix did not close it | " note
+    }
+    /^\| *R[0-9]+ *\|/ { print }
+  ' "$TMP/message.md" > "$TMP/open.txt"
+  # Regressions are raised as headings, not table rows — collect those too.
+  # The pattern must match the one the Metrics footer counts with, or a regression can be
+  # counted there while the section the human actually reads says "Nothing open" — which is
+  # the exact disappearing-finding outcome this ledger exists to prevent. So: no dash
+  # required here, because none is required there.
+  grep -oE '^### +R[0-9]+.*' "$TMP/message.md" 2>/dev/null \
+    | sed 's/^### */| regression | — | introduced by the fixes | /' >> "$TMP/open.txt" || true
+  # A `human` response was never a dispute between the models; it still needs deciding.
+  grep -E "^\| *$gate-F[0-9]+ *\|.*\| *human *\|" "$response_file" 2>/dev/null \
+    | awk -F'|' '{ gsub(/^[ \t]+|[ \t]+$/,"",$2); gsub(/^[ \t]+|[ \t]+$/,"",$3);
+                   print "| " $2 " | " $3 " | product decision, not the models\x27 | —" }' \
+    >> "$TMP/open.txt" || true
+
+  {
+    echo
+    echo "## For the human"
+    echo
+    if [[ -s "$TMP/open.txt" ]]; then
+      echo "These did not close. Nothing below was settled between the models — each one needs you."
+      echo
+      echo "| id | severity | why it is open | note |"
+      echo "|---|---|---|---|"
+      cat "$TMP/open.txt"
+    else
+      echo "Nothing open. Every round-1 finding was resolved or conceded, and round 2 found"
+      echo "no regressions."
+    fi
+  } >> "$LEDGER"
+
+  # --- §4.4 item 6: metrics footer -------------------------------------------
+  # `grep -c` already prints 0 when it matches nothing — it just exits non-zero doing it.
+  # `|| echo 0` would print a SECOND zero and corrupt the row, so swallow the status instead.
+  verdicts()  { grep -cE "^\| *$gate-F[0-9]+ *\|.*\| *$1 *\|" "$TMP/message.md" 2>/dev/null || true; }
+  responses() { grep -cE "^\| *$gate-F[0-9]+ *\|.*\| *$1 *\|" "$response_file" 2>/dev/null || true; }
+  r1_blockers="$(grep -cE "^### +$gate-F[0-9]+" "$LEDGER" 2>/dev/null || true)"
+  open_count="$(wc -l < "$TMP/open.txt" | tr -d ' ')"
+  r1_elapsed="$(sed -n 's/^<!-- round 1 wall clock: \([0-9]*\)s -->$/\1/p' "$LEDGER" | head -1)"
+
+  {
+    echo
+    echo "## Metrics"
+    echo
+    echo "| | |"
+    echo "|---|---|"
+    echo "| round-1 findings (BLOCKER+MAJOR) | $r1_blockers |"
+    echo "| accepted / rejected / human | $(responses accepted) / $(responses rejected) / $(responses human) |"
+    echo "| resolved / not resolved | $(verdicts resolved) / $(verdicts 'not resolved') |"
+    echo "| conceded / maintained | $(verdicts concede) / $(verdicts maintain) |"
+    echo "| regressions found in round 2 | $(grep -cE '^### +R[0-9]+' "$TMP/message.md" 2>/dev/null || true) |"
+    echo "| still open for the human | $open_count |"
+    echo "| wall clock | round 1 ${r1_elapsed:-?}s · round 2 ${elapsed}s |"
+  } >> "$LEDGER"
+
+  # Bump the round count in the header. Done with awk + mv rather than `sed -i`, whose
+  # in-place flag differs between BSD and GNU.
+  awk '{ sub(/^- \*\*rounds:\*\* 1$/, "- **rounds:** 2"); print }' "$LEDGER" > "$TMP/ledger.new"
+  mv "$TMP/ledger.new" "$LEDGER"
+
+  if [[ "$open_count" -gt 0 ]]; then
+    note "$open_count item(s) open for you — see 'For the human' in the ledger"
+  fi
+fi
+
+note "ledger: ${LEDGER/#$HOME/~}   (${elapsed}s, $blockers BLOCKER, $majors MAJOR)"
+
+if [[ "$round" == "1" && "$parseable" -eq 1 && "$((blockers + majors))" -eq 0 ]]; then
+  note "no BLOCKER/MAJOR — round 2 is not required for this gate"
+fi
+
+record_scorecard

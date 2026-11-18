@@ -1,0 +1,77 @@
+# CI for the public repo. Generic checks only: it holds no secrets, no scanner and no denylist
+# (the private-term checks run in the local pre-push guard). Triggers are pull_request and push
+# to main, never pull_request_target. Fork PRs wait for approval (a repository setting).
+# Every GitHub context value reaches a shell through env:, never by inline interpolation.
+name: CI
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+jobs:
+  checks:
+    runs-on: macos-latest
+    timeout-minutes: 30
+    steps:
+      - name: Check out the repo
+        uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5.1.0
+        with:
+          fetch-depth: 0
+          persist-credentials: false
+
+      # Pinned release binary, checksum from the release's gitleaks_8.30.1_checksums.txt.
+      # Downloaded outside the workspace so the scans below never see the archive.
+      - name: Install gitleaks
+        env:
+          GITLEAKS_VERSION: 8.30.1
+          GITLEAKS_SHA256: b40ab0ae55c505963e365f271a8d3846efbc170aa17f2607f13df610a9aeb6a5
+        run: |
+          set -euo pipefail
+          archive="$RUNNER_TEMP/gitleaks.tar.gz"
+          curl -fsSL -o "$archive" "https://github.com/gitleaks/gitleaks/releases/download/v${GITLEAKS_VERSION}/gitleaks_${GITLEAKS_VERSION}_darwin_arm64.tar.gz"
+          echo "${GITLEAKS_SHA256}  ${archive}" | shasum -a 256 -c -
+          mkdir -p "$RUNNER_TEMP/gitleaks-bin"
+          tar -xzf "$archive" -C "$RUNNER_TEMP/gitleaks-bin" gitleaks
+          echo "$RUNNER_TEMP/gitleaks-bin" >> "$GITHUB_PATH"
+
+      - name: Tests
+        run: scripts/test-all
+
+      - name: Install into a temporary HOME, with and without an overlay
+        run: scripts/install-smoke
+
+      - name: Privacy check, tree
+        run: scripts/privacy-check .
+
+      - name: Privacy check, commits
+        env:
+          EVENT_NAME: ${{ github.event_name }}
+          PR_BASE: ${{ github.event.pull_request.base.sha }}
+          PR_HEAD: ${{ github.event.pull_request.head.sha }}
+          PUSH_BEFORE: ${{ github.event.before }}
+          PUSH_AFTER: ${{ github.sha }}
+          PUSH_FORCED: ${{ github.event.forced }}
+        # A forced push replaced the history: its old head is gone from the remote, so
+        # `before..after` cannot resolve and the whole history is scanned instead.
+        run: |
+          set -euo pipefail
+          if [ "$EVENT_NAME" = "pull_request" ]; then
+            scripts/privacy-check --range "$PR_BASE..$PR_HEAD"
+          elif [ "$PUSH_BEFORE" = "0000000000000000000000000000000000000000" ] || [ "$PUSH_FORCED" = "true" ]; then
+            scripts/privacy-check --range "$PUSH_AFTER"
+          else
+            scripts/privacy-check --range "$PUSH_BEFORE..$PUSH_AFTER"
+          fi
+
+      - name: Relative links
+        run: scripts/check-links
+
+      - name: Secrets, history
+        run: gitleaks git --redact
+
+      - name: Secrets, tree
+        run: gitleaks dir --redact

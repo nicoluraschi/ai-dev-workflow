@@ -1,0 +1,8 @@
+# Codex profile: audit
+# Selective, read-only auditor used by the Claude Code `feature-workflow` skill
+# (gates 1b / 2b / 6b), always through the `codex-audit` wrapper — never raw `codex exec`.
+# Profile V2: this file is layered on top of ~/.codex/config.toml.
+model = "gpt-5.6-sol"
+model_reasoning_effort = "high"
+approval_policy = "never"
+sandbox_mode = "read-only"

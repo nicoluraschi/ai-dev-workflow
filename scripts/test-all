@@ -1,0 +1,72 @@
+#!/usr/bin/env python3
+"""test-all: run every test suite in the repo, one line each, and fail if any fails.
+
+  test-all           run all suites
+  test-all --list    print the suites it would run and exit
+
+Suites are found by glob, never listed by hand, so a new test file is picked up:
+claude/hooks/test_*.py, claude/skills/**/test_*.py, scripts/test_*.py, codex/test_*.py,
+codex/**/test_*.sh, git/bin/test_*, shell/test_*.zsh, zed/bin/test_*.sh. Anything under overlay/
+is excluded (that is the private layer). A file runs by its extension (.py with this
+interpreter, .sh with bash, .zsh with zsh); other test_* files are fixtures and are skipped.
+Each suite runs from the repo root. Exit 0 all passed, 1 a failure or no suites. Stdlib only.
+"""
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+ROOT = Path(__file__).resolve().parent.parent
+GLOBS = ("claude/hooks/test_*.py", "claude/skills/**/test_*.py", "scripts/test_*.py",
+         "codex/test_*.py", "codex/**/test_*.sh", "git/bin/test_*", "shell/test_*.zsh",
+         "zed/bin/test_*.sh")
+RUNNERS = {".py": [sys.executable], ".sh": ["bash"], ".zsh": ["zsh"]}
+TIMEOUT = 900
+
+
+def discover():
+    found = set()
+    for pattern in GLOBS:
+        for p in ROOT.glob(pattern):
+            rel = p.relative_to(ROOT)
+            if p.is_file() and rel.parts[0] != "overlay" and p.suffix in RUNNERS:
+                found.add(rel.as_posix())
+    return sorted(found)
+
+
+def run_suite(rel):
+    start = time.monotonic()
+    try:
+        r = subprocess.run([*RUNNERS[Path(rel).suffix], str(ROOT / rel)], cwd=ROOT, text=True,
+                           capture_output=True, errors="replace", timeout=TIMEOUT)
+        code, output = r.returncode, r.stdout + r.stderr
+    except subprocess.TimeoutExpired:
+        code, output = 124, f"timed out after {TIMEOUT}s"
+    except OSError as e:
+        code, output = 127, f"cannot run: {e}"
+    return code, output, time.monotonic() - start
+
+
+def main(argv):
+    suites = discover()
+    if "--list" in argv:
+        print("\n".join(suites))
+        return 0
+    if not suites:
+        print("test-all: no test suites found", file=sys.stderr)
+        return 1
+    failed = 0
+    for rel in suites:
+        code, output, secs = run_suite(rel)
+        if code == 0:
+            print(f"PASS  {rel} ({secs:.1f}s)", flush=True)
+        else:
+            failed += 1
+            print(f"FAIL  {rel} (exit {code}, {secs:.1f}s)", flush=True)
+            print("\n".join(output.rstrip().splitlines()[-40:]), flush=True)
+    print(f"{len(suites)} suites, {failed} failed")
+    return 1 if failed else 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

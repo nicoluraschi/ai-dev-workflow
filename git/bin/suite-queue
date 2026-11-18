@@ -1,0 +1,238 @@
+#!/usr/bin/env bash
+#
+# suite-queue — run a heavy test suite one at a time per kind, machine-wide.
+#
+#   suite-queue <ruby|js> <command> [args...]
+#
+# Pre-push hooks from several sessions start their suites together, and the
+# machine cannot carry them all. This takes a per-kind slot first: one Ruby
+# suite and one JS suite at a time, across every repo. A run that finds its
+# slot busy says who holds it, waits, then runs; the command's exit status is
+# the script's own.
+#
+# The lock is an flock held on fd 9 by this process, which runs the command as a
+# child with fd 9 closed and exits with its status. The kernel drops the lock
+# when this process dies, so a killed run frees the slot at once and there is no
+# stale lock to clean up; a daemon the suite leaves behind cannot inherit it and
+# pin the slot. (The `lockf file cmd` form is avoided on purpose: its "busy"
+# status 75 would be indistinguishable from the command itself exiting 75.)
+#
+# Verified skip: a pass is recorded against the exact content it tested (kind,
+# argv, directory, tree hash of tracked + untracked files), under
+# <git-common-dir>/suite-queue/passed/. A later run on the same content with a
+# clean working tree is skipped before taking the slot. A run that executes
+# deletes its record first; a record is written only on a pass with content
+# unchanged. Any failure computing or storing a key means the suite just runs.
+#
+# Environment:
+#   SUITE_QUEUE_FORCE    1 = run whatever the records say
+#   SUITE_QUEUE_TIMEOUT  seconds to wait for the slot (positive integer, default 1200)
+#   SUITE_QUEUE_TTY      where the wait line goes first (default /dev/tty); if it
+#                        cannot be opened for writing the line goes to stderr
+#
+# Exit: 64 usage, 75 timed out waiting; otherwise the command's status.
+
+set -euo pipefail
+
+usage() {
+  echo "usage: suite-queue <ruby|js> <command> [args...]" >&2
+  exit 64
+}
+
+[[ $# -ge 2 ]] || usage
+kind="$1"; shift
+case "$kind" in
+  ruby | js) ;;
+  *) usage ;;
+esac
+
+timeout="${SUITE_QUEUE_TIMEOUT:-1200}"
+if [[ ! "$timeout" =~ ^[1-9][0-9]*$ ]]; then
+  echo "suite-queue: SUITE_QUEUE_TIMEOUT must be a positive integer of seconds, got '$timeout'" >&2
+  exit 64
+fi
+
+# git exports GIT_DIR, without GIT_WORK_TREE, to a hook run from a linked worktree. In a
+# subdirectory (lefthook's root:) git then takes the cwd for the top of the work tree, so
+# the key would hash that subdirectory alone and never match HEAD. This script's own git
+# finds the repo from the cwd instead, as a shell run does; the suite keeps the caller's env.
+git() {
+  if [[ -n "${GIT_DIR:-}" && -z "${GIT_WORK_TREE:-}" ]]; then
+    env -u GIT_DIR git "$@"
+  else
+    command git "$@"
+  fi
+}
+
+dir="$HOME/.cache/suite-queue"
+mkdir -p -m 700 "$dir"
+chmod 700 "$dir"
+lock="$dir/$kind.lock"
+holder_file="$dir/$kind.holder"
+
+# One line to the tty, else to stderr — never both.
+announce() {
+  if ! { printf '%s\n' "$1" >>"${SUITE_QUEUE_TTY:-/dev/tty}"; } 2>/dev/null; then
+    printf '%s\n' "$1" >&2
+  fi
+}
+
+# Holder identity, read back from the file the holder wrote. Best effort: a
+# missing or unreadable file only degrades the message. Non-printable bytes
+# are stripped, since the file is not ours alone to trust.
+holder_text() {
+  local text=""
+  text="$({ tr -cd '[:print:]' <"$holder_file"; } 2>/dev/null)" || text=""
+  echo "waiting for $kind slot (held by ${text:-unknown})"
+}
+
+write_holder() {
+  local common branch repo
+  # The repo name comes from the main repo (the parent of the common git dir),
+  # so a worktree at ~/worktrees/<repo>/<branch> is named <repo>, not <branch>.
+  if common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    repo="$(basename "$(dirname "$common")")"
+    branch="$(git symbolic-ref --short -q HEAD 2>/dev/null)" || branch="(detached)"
+  else
+    repo="$(basename "$PWD")"
+    branch="-"
+  fi
+  { printf '%s %s since %s\n' "$repo" "$branch" "$(date +%H:%M)" >"$holder_file"; } 2>/dev/null || true
+}
+
+lockf_failed() {
+  echo "suite-queue: lockf failed ($1)" >&2
+  exit "$1"
+}
+
+# --- verified skip ------------------------------------------------------------
+# The key is the exact content under test: kind, argv, repo-relative directory
+# and the tree hash of the working copy (tracked + untracked, not ignored), taken
+# from a temporary index so the real one is never touched. Every step is checked;
+# any failure leaves key_file empty, so the suite runs and nothing is recorded.
+key_tree=""
+compute_key() {
+  local out="$1" top prefix real_index flags; shift
+  top="$(git rev-parse --show-toplevel 2>/dev/null)" || return 1
+  prefix="$(git rev-parse --show-prefix 2>/dev/null)" || return 1
+  real_index="$(git rev-parse --path-format=absolute --git-path index 2>/dev/null)" || return 1
+  # No key when git is told not to look at some files (assume-unchanged,
+  # skip-worktree) or when a submodule's content is not in the tree hash.
+  flags="$(git -C "$top" ls-files -v 2>/dev/null)" || return 1
+  if grep -q '^[a-zS]' <<<"$flags"; then return 1; fi
+  flags="$(git -C "$top" ls-files -s 2>/dev/null)" || return 1
+  if grep -q '^160000' <<<"$flags"; then return 1; fi
+  rm -f "$work/index"
+  # -p keeps the index's mtime: git's racy check compares entries against it, and
+  # a fresh mtime would make a same-size edit in that second hash as the old blob.
+  if [[ -f "$real_index" ]]; then cp -p "$real_index" "$work/index" || return 1; fi
+  GIT_INDEX_FILE="$work/index" git -C "$top" add -A >/dev/null 2>&1 || return 1
+  key_tree="$(GIT_INDEX_FILE="$work/index" git -C "$top" write-tree 2>/dev/null)" || return 1
+  { printf 'v1\0%s\0%s\0%s' "$kind" "$prefix" "$key_tree"; printf '\0%s' "$@"; } >"$out" 2>/dev/null || return 1
+}
+
+# The working copy equals HEAD's tree: nothing staged, modified or untracked.
+tree_clean() {
+  [[ "$(git rev-parse -q --verify 'HEAD^{tree}' 2>/dev/null)" == "$key_tree" ]]
+}
+
+# A valid record is named by the key's sha256, is under 7 days old, and holds
+# exactly the key.
+record_matches() {
+  [[ -f "$record" && ! -L "$record" ]] || return 1
+  [[ -n "$(find "$record" -mtime -7 2>/dev/null)" ]] || return 1
+  cmp -s "$record" "$key_file"
+}
+
+# Record a pass only if the content is unchanged since the key was taken.
+record_pass() {
+  compute_key "$work/key2" "$@" || return 0
+  cmp -s "$key_file" "$work/key2" || return 0
+  mkdir -p "$records" 2>/dev/null || return 0
+  chmod 700 "$(dirname "$records")" "$records" 2>/dev/null || return 0
+  cp "$key_file" "$records/$sha.tmp.$$" 2>/dev/null || return 0
+  mv -f "$records/$sha.tmp.$$" "$record" 2>/dev/null || { rm -f "$records/$sha.tmp.$$"; return 0; }
+  # Prune what is no longer valid (the negation of record_matches' age test), and
+  # only files named with exactly 64 lowercase hex characters, optionally
+  # followed by .tmp.<digits> (a leftover of an interrupted write).
+  local f
+  while IFS= read -r f; do
+    [[ "$(basename "$f")" =~ ^[0-9a-f]{64}(\.tmp\.[0-9]+)?$ ]] && rm -f "$f"
+  done < <(find "$records" -maxdepth 1 -type f ! -mtime -7 2>/dev/null)
+  return 0
+}
+
+# Take the key of the content as it is now into $1; on success it becomes the
+# run's key (key_file, sha, record), on failure there is no key.
+take_key() {
+  local out="$1"; shift
+  key_file=""
+  compute_key "$out" "$@" || return 1
+  sha="$(shasum -a 256 <"$out" | cut -d' ' -f1)" || return 1
+  key_file="$out"
+  record="$records/$sha"
+}
+
+key_file=""; work=""; records=""; record=""; sha=""
+if git rev-parse --show-toplevel >/dev/null 2>&1 && work="$(mktemp -d 2>/dev/null)"; then
+  trap 'rm -rf "$work"' EXIT
+  if common="$(git rev-parse --path-format=absolute --git-common-dir 2>/dev/null)"; then
+    records="$common/suite-queue/passed"
+    take_key "$work/key1" "$@" || true
+  fi
+fi
+
+if [[ -n "$key_file" && "${SUITE_QUEUE_FORCE:-}" != 1 ]] && tree_clean && record_matches; then
+  echo "suite-queue: skipped $kind — passed on this exact content at $(date -r "$record" +%H:%M) (SUITE_QUEUE_FORCE=1 to run)" >&2
+  exit 0
+fi
+
+exec 9>>"$lock"
+status=0
+lockf -s -t 0 9 || status=$?
+if [[ "$status" -eq 75 ]]; then
+  announce "suite-queue: $(holder_text)"
+  status=0
+  lockf -s -t "$timeout" 9 || status=$?
+  if [[ "$status" -eq 75 ]]; then
+    echo "suite-queue: timed out after ${timeout}s waiting for $kind slot" >&2
+    exit 75
+  fi
+fi
+[[ "$status" -eq 0 ]] || lockf_failed "$status"
+write_holder
+
+# This run is about to execute, so it replaces any earlier verdict on its key:
+# drop the record now that the slot is ours (a run that times out or is stopped
+# while waiting keeps a valid pass), and write it again only on a pass. Holding
+# the slot means no other run of this kind can record one while this one runs.
+# The content may have changed while waiting, so the key is taken again first:
+# the record dropped, and the one written on a pass, are those of the content
+# this run actually executes on.
+if [[ -n "$key_file" ]]; then
+  if take_key "$work/key3" "$@"; then rm -f "$record" 2>/dev/null || true; fi
+fi
+
+# Run the command as a child with fd 9 closed: this process keeps the lock until
+# the command exits, and a daemon the suite leaves behind cannot inherit it.
+# This process outlives the child on any catchable signal, so the slot is never
+# freed while the suite still runs (kill -9 cannot be caught). TERM, HUP and QUIT
+# are passed on as TERM. INT is not passed on: Ctrl-C already reached the suite
+# through the terminal's process group, and a second one makes RSpec abort
+# instead of finishing cleanly. The traps go in before the fork, so no signal
+# lands in between. stdin is passed explicitly because bash gives background
+# jobs /dev/null otherwise.
+child=""
+forward() { [[ -n "$child" ]] && kill -TERM "$child" 2>/dev/null; return 0; }
+trap forward TERM HUP QUIT
+trap : INT
+"$@" 9>&- 0<&0 &
+child=$!
+status=0
+wait "$child" || status=$?
+while kill -0 "$child" 2>/dev/null; do
+  status=0
+  wait "$child" || status=$?
+done
+if [[ "$status" -eq 0 && -n "$key_file" ]]; then record_pass "$@"; fi
+exit "$status"

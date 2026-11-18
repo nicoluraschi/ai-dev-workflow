@@ -1,0 +1,131 @@
+#!/usr/bin/env python3
+"""pre-push guard for the public repo. Fails closed.
+
+Run by lefthook as `scripts/pre-push {1} {2}` (remote name, push URL) with git's pre-push stdin:
+one `<local ref> <local sha> <remote ref> <remote sha>` line per ref. For each ref it checks
+
+  - the push URL is the public repo (ssh, scp or https form), and the local history has exactly
+    one root commit, the SHA in $HOME/.config/ai-workflow/public-root;
+  - `gitleaks git --log-opts=<range>` is clean;
+  - `privacy-check --private --range <range>` is clean: added lines, messages, commit emails,
+    ref names and tag messages, plus the extra scanner and the private denylist;
+  - the remote ref name passes `privacy-check --private --stdin`.
+
+<range> is `<remote sha>..<local sha>`, or just the local sha (the whole ref) when the remote
+sha is all zeros. A remote sha that is not a local commit is refused before any scan (fetch
+first), since gitleaks passes a range it cannot resolve. A deletion is skipped. No ref line at
+all is a failure, as is a missing gitleaks, root file, extra-scanner pointer, scanner or
+denylist. Exit 0 pass, 1 refuse. Stdlib only.
+"""
+import os
+import re
+import shutil
+import subprocess
+import sys
+from pathlib import Path
+
+PUBLIC_REPO = "nicoluraschi/ai-dev-workflow"
+REMOTE = re.compile(r"^(?:https?://(?:[^@/]+@)?|ssh://git@|git@)github\.com[:/]([^/\s]+)/([^/\s]+?)(?:\.git)?/?$",
+                    re.I)
+PRIVACY_CHECK = Path(os.path.realpath(__file__)).parent / "privacy-check"
+
+
+class Refuse(Exception):
+    pass
+
+
+def normalize(url):
+    m = REMOTE.match(url.strip())
+    return f"{m.group(1)}/{m.group(2)}".lower() if m else None
+
+
+def run(cmd, stdin=None):
+    try:
+        return subprocess.run(cmd, input=stdin, text=True, capture_output=True, errors="replace")
+    except OSError as e:
+        raise Refuse(f"cannot run {cmd[0]}: {e}")
+
+
+def echo(r):
+    sys.stdout.write(r.stdout)
+    sys.stderr.write(r.stderr)
+
+
+def public_root():
+    path = Path(os.path.expanduser("~")) / ".config/ai-workflow/public-root"
+    try:
+        shas = path.read_text().split()
+    except OSError:
+        raise Refuse("no ~/.config/ai-workflow/public-root; cannot verify the root commit")
+    if len(shas) != 1 or not re.fullmatch(r"[0-9a-f]{40,64}", shas[0]):
+        raise Refuse("~/.config/ai-workflow/public-root must hold exactly one commit SHA")
+    return shas[0]
+
+
+def check_ref(local_sha, remote_sha, remote_ref, root, remote):
+    failures = []
+    r = run(["git", "rev-list", "--max-parents=0", local_sha])
+    if r.returncode != 0:
+        raise Refuse(f"cannot list the root commits of {local_sha}: {r.stderr.strip()}")
+    if r.stdout.split() != [root]:
+        failures.append(f"{remote_ref}: root commit(s) {r.stdout.split()} are not the approved "
+                        "public-root")
+    if set(remote_sha) == {"0"}:
+        rng = local_sha
+    else:
+        # gitleaks scans 0 commits and exits 0 on a range that doesn't resolve: refuse first.
+        if run(["git", "cat-file", "-e", f"{remote_sha}^{{commit}}"]).returncode != 0:
+            failures.append(f"{remote_ref}: remote sha {remote_sha} is not a local commit; "
+                            f"run `git fetch {remote}` first")
+            return failures
+        rng = f"{remote_sha}..{local_sha}"
+    leaks = run(["gitleaks", "git", f"--log-opts={rng}", "--redact"])
+    if leaks.returncode != 0:
+        echo(leaks)
+        failures.append(f"{remote_ref}: gitleaks found secrets or failed (exit {leaks.returncode})")
+    pc = run([sys.executable, "-I", str(PRIVACY_CHECK), "--private", "--range", rng])
+    if pc.returncode != 0:
+        echo(pc)
+        failures.append(f"{remote_ref}: privacy-check refused the range (exit {pc.returncode})")
+    name = run([sys.executable, "-I", str(PRIVACY_CHECK), "--private", "--stdin"],
+               stdin=remote_ref + "\n")
+    if name.returncode != 0:
+        echo(name)
+        failures.append(f"remote ref name {remote_ref!r}: privacy-check refused it "
+                        f"(exit {name.returncode})")
+    return failures
+
+
+def main(argv):
+    if len(argv) != 2:
+        raise Refuse("usage: pre-push <remote name> <push url> (ref lines on stdin)")
+    if normalize(argv[1]) != PUBLIC_REPO:
+        raise Refuse(f"push URL {argv[1]!r} is not {PUBLIC_REPO}")
+    if not shutil.which("gitleaks"):
+        raise Refuse("gitleaks is not on PATH; failing closed")
+    root = public_root()
+    lines = [l.split() for l in sys.stdin.read().splitlines() if l.strip()]
+    if not lines:
+        raise Refuse("no ref lines on stdin; refusing (is lefthook's use_stdin set?)")
+    failures = []
+    for fields in lines:
+        if len(fields) != 4:
+            raise Refuse(f"malformed ref line: {' '.join(fields)!r}")
+        _local_ref, local_sha, remote_ref, remote_sha = fields
+        if set(local_sha) == {"0"}:
+            continue  # a deletion pushes no content
+        failures += check_ref(local_sha, remote_sha, remote_ref, root, argv[0])
+    for f in failures:
+        print(f"pre-push: {f}", file=sys.stderr)
+    return 1 if failures else 0
+
+
+if __name__ == "__main__":
+    try:
+        sys.exit(main(sys.argv[1:]))
+    except Refuse as e:
+        print(f"pre-push: {e}", file=sys.stderr)
+        sys.exit(1)
+    except Exception as e:
+        print(f"pre-push: internal error: {type(e).__name__}: {e}", file=sys.stderr)
+        sys.exit(1)

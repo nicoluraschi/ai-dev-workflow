@@ -1,0 +1,153 @@
+#!/usr/bin/env python3
+"""inflight — what is in flight: your open PRs across repos, and every worktree.
+
+    inflight    (from anywhere; read-only)
+
+Open PRs come from one `gh search prs --author @me --state open`, so repos with no local
+checkout show too. Worktrees are every git worktree under ~/worktrees (or $INFLIGHT_ROOT), at
+any depth, since branch names nest (dependabot/npm_and_yarn/web/x). Each is matched to its PR
+by head branch with one `gh pr list` per repo (fork PRs excluded: their branch is not this
+one), and gets one line: PR state, uncommitted files, unpushed commits, days since its last
+commit.
+
+A worktree is STALE when its PR is merged or closed, or when it has no PR and no commit in more
+than STALE_DAYS days. A stale worktree whose
+removal could lose work says "check before removing" and why: uncommitted files, a status git
+could not read, or commits not on GitHub (HEAD is not its PR's last head, or, with no PR, HEAD
+is on no remote branch). Nothing is removed here: deleting is /ship's job, or the human's.
+
+A gh failure for one repo leaves that repo's worktrees at "pr ?" and never STALE, since an open
+PR may be hiding there. The rest of the report still prints.
+
+Exit: always 0.
+"""
+import json
+import os
+import subprocess
+import time
+from datetime import datetime
+
+STALE_DAYS = 7
+
+
+def run(cwd, *args):
+    """stdout of a command, or None if it failed or is not installed."""
+    try:
+        r = subprocess.run(args, cwd=cwd, capture_output=True, text=True)
+    except OSError:
+        return None
+    return r.stdout.strip() if r.returncode == 0 else None
+
+
+def gh_json(cwd, *args):
+    out = run(cwd, "gh", *args)
+    return None if out is None else json.loads(out)
+
+
+def find_worktrees(root):
+    for top, dirs, files in os.walk(root):
+        if ".git" in files or ".git" in dirs:
+            dirs[:] = []
+            yield top
+        else:
+            dirs.sort()
+
+
+def pick(prs, branch):
+    """The branch's PR: an open one if any, else the newest."""
+    mine = [p for p in prs if p["headRefName"] == branch and not p["isCrossRepository"]]
+    if not mine:
+        return None
+    return max(mine, key=lambda p: (p["state"] == "OPEN", p["number"]))
+
+
+def repo_of(url):
+    """owner/name from https://github.com/owner/name/pull/n."""
+    return "/".join(url.split("/")[3:5])
+
+
+def worktree(path, now, cache):
+    branch = run(path, "git", "branch", "--show-current") or ""
+    common = run(path, "git", "rev-parse", "--path-format=absolute", "--git-common-dir")
+    if common not in cache:
+        cache[common] = gh_json(path, "pr", "list", "--state", "all", "--limit", "1000",
+                                "--json", "number,state,headRefName,headRefOid,"
+                                          "isCrossRepository,url")
+    prs = cache[common]
+    head = run(path, "git", "rev-parse", "HEAD")
+    status = run(path, "git", "status", "--porcelain")
+    ahead = run(path, "git", "rev-list", "--count", "@{u}..HEAD")
+    age = (now - int(run(path, "git", "log", "-1", "--format=%ct") or now)) / 86400
+
+    pr = None
+    if not branch:
+        label = "detached"
+    elif prs is None:
+        label = "pr ?"
+    else:
+        pr = pick(prs, branch)
+        label = f"{pr['state'].lower()} #{pr['number']}" if pr else "no PR"
+
+    if prs is None and branch:
+        stale = False
+    elif pr:
+        stale = pr["state"] in ("MERGED", "CLOSED")
+    else:
+        stale = age > STALE_DAYS
+
+    risks = []
+    if status is None:
+        risks.append("status unreadable")
+    elif status:
+        risks.append("uncommitted files")
+    if pr:
+        local = pr["headRefOid"] != head
+    else:
+        local = run(path, "git", "rev-list", "--count", "HEAD", "--not", "--remotes") != "0"
+    if local:
+        risks.append("commits not on GitHub")
+    return {
+        "path": path, "label": label, "stale": stale, "age": age, "risks": risks,
+        "dirty": "?" if status is None else len(status.splitlines()) if status else 0,
+        "ahead": ahead, "pr": (repo_of(pr["url"]), pr["number"]) if pr else None,
+    }
+
+
+def main():
+    root = os.environ.get("INFLIGHT_ROOT") or os.path.expanduser("~/worktrees")
+    now = time.time()
+    cache = {}
+    wts = [worktree(p, now, cache) for p in find_worktrees(root)]
+    wts.sort(key=lambda w: (w["stale"], w["path"]))
+    linked = {w["pr"] for w in wts if w["pr"]}
+
+    prs = gh_json(None, "search", "prs", "--author", "@me", "--state", "open", "--limit", "100",
+                  "--json", "number,title,repository,isDraft,updatedAt,url")
+    if prs is None:
+        print("Open PRs: gh search failed")
+    else:
+        print(f"Open PRs ({len(prs)})")
+        for p in sorted(prs, key=lambda p: p["updatedAt"], reverse=True):
+            repo = p["repository"]["nameWithOwner"]
+            updated = datetime.fromisoformat(p["updatedAt"].replace("Z", "+00:00")).timestamp()
+            tags = ["draft"] if p["isDraft"] else []
+            if (repo, p["number"]) in linked:
+                tags.append("[worktree]")
+            print(f"  {repo}#{p['number']}  {(now - updated) / 86400:.0f}d  {p['title']}"
+                  + "".join("  " + t for t in tags))
+
+    stale = sum(w["stale"] for w in wts)
+    print(f"\nWorktrees under {root.replace(os.path.expanduser('~'), '~', 1)} "
+          f"({len(wts)}, {stale} stale)")
+    for w in wts:
+        rel = os.path.relpath(w["path"], root)
+        ahead = "no upstream" if w["ahead"] is None else f"{w['ahead']} unpushed"
+        note = ("  check before removing: " + ", ".join(w["risks"])
+                if w["stale"] and w["risks"] else "")
+        print(f"{'STALE' if w['stale'] else '     '} {rel}  {w['label']}  {w['dirty']} dirty  "
+              f"{ahead}  {w['age']:.0f}d{note}")
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

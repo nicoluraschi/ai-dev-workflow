@@ -1,0 +1,88 @@
+#!/usr/bin/env python3
+"""check-links: every relative link in the tracked *.md files must resolve.
+
+  check-links [DIR]      run in a git checkout; DIR (default: the whole repo) limits the files
+
+Checks inline links and images `[t](path)`, `[t](path#anchor)`, `[t](<path>)` and reference
+definitions `[ref]: path`, relative to the file (a leading / is relative to the repo root). A file
+or a directory counts as resolved; the anchor itself is not checked. http(s), mailto, any other
+`scheme:` target, scp-style `user@host:path` and #-only links are skipped, as are fenced blocks
+and inline code. Exit 0 all resolve, 1 broken links listed as `file:line: target`, 2 error.
+Stdlib only.
+"""
+import os
+import re
+import subprocess
+import sys
+
+INLINE = re.compile(r"\]\(\s*<?([^)>\s]+)>?(?:\s+[\"'][^)]*[\"'])?\s*\)")
+REFERENCE = re.compile(r"^\s{0,3}\[[^\]]+\]:\s*<?(\S+?)>?(?:\s+[\"'].*)?\s*$")
+FENCE = re.compile(r"^\s*(```|~~~)")
+SKIPPED = re.compile(r"^(#|[a-zA-Z][a-zA-Z0-9+.-]*:|[^/\s]+@[^/\s]+:)")
+
+
+def tracked_markdown(scope):
+    r = subprocess.run(["git", "ls-files", "-z", "--", "*.md"], capture_output=True, text=True)
+    if r.returncode != 0:
+        raise RuntimeError(f"not a git checkout: {r.stderr.strip()}")
+    files = [f for f in r.stdout.split("\0") if f]
+    if scope:
+        prefix = os.path.relpath(scope).rstrip("/") + "/"
+        files = [f for f in files if f.startswith(prefix)]
+    return files
+
+
+def targets(path):
+    """[(line number, target)] for the links of one markdown file."""
+    out, fenced = [], None
+    with open(path, encoding="utf-8", errors="replace") as f:
+        for n, line in enumerate(f, 1):
+            m = FENCE.match(line)
+            if m:
+                fenced = None if fenced == m.group(1) else (fenced or m.group(1))
+                continue
+            if fenced:
+                continue
+            line = re.sub(r"`[^`]*`", "", line)
+            ref = REFERENCE.match(line)
+            found = [ref.group(1)] if ref else INLINE.findall(line)
+            out += [(n, t) for t in found]
+    return out
+
+
+def resolves(md, target, root):
+    if SKIPPED.match(target):
+        return True
+    rel = re.split(r"[#?]", target, maxsplit=1)[0]
+    if not rel:
+        return True
+    base = root if rel.startswith("/") else os.path.dirname(os.path.join(root, md))
+    return os.path.exists(os.path.normpath(os.path.join(base, rel.lstrip("/"))))
+
+
+def main(argv):
+    try:
+        top = subprocess.run(["git", "rev-parse", "--show-toplevel"], capture_output=True, text=True)
+        if top.returncode != 0:
+            raise RuntimeError("not a git checkout")
+        root = top.stdout.strip()
+        scope = os.path.relpath(os.path.abspath(argv[0]), root) if argv else None
+        os.chdir(root)
+        broken = []
+        for md in tracked_markdown(scope):
+            if not os.path.isfile(md):
+                continue
+            broken += [f"{md}:{n}: {t}" for n, t in targets(md) if not resolves(md, t, root)]
+    except Exception as e:
+        print(f"check-links: {e}", file=sys.stderr)
+        return 2
+    for line in broken:
+        print(line)
+    if broken:
+        print(f"check-links: {len(broken)} broken link(s)")
+        return 1
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main(sys.argv[1:]))

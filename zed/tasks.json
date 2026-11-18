@@ -1,0 +1,40 @@
+// User-level tasks — global, never per-project. Zed reads this from
+// ~/.config/zed/tasks.json; no .zed/ directory is ever created in a repo.
+//
+// $ZED_FILE (absolute), not $ZED_RELATIVE_FILE: relative is relative to the
+// WORKTREE root, and in a monorepo the Rails app is a level down in backend/.
+// zed-ruby-test walks up from the file to the nearest Gemfile instead, and
+// detects RSpec vs Minitest there, so these three tasks work unchanged in
+// every project.
+[
+  {
+    "label": "ruby: test file",
+    "command": "zed-ruby-test",
+    "args": ["$ZED_FILE"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "tags": ["ruby-test"]
+  },
+  {
+    "label": "ruby: test at cursor",
+    "command": "zed-ruby-test",
+    "args": ["$ZED_FILE", "$ZED_ROW"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "tags": ["ruby-test"]
+  },
+  {
+    "label": "ruby: full suite",
+    "command": "zed-ruby-test",
+    "args": ["--suite", "$ZED_FILE"],
+    "cwd": "$ZED_WORKTREE_ROOT",
+    "reveal": "always",
+    "use_new_terminal": false,
+    "allow_concurrent_runs": false,
+    "tags": ["ruby-test"]
+  }
+]

@@ -1,0 +1,104 @@
+#!/usr/bin/env bash
+#
+# zed-ruby-test — run a Ruby test from Zed, for whatever project is open.
+#
+#   zed-ruby-test <file>            run that test file
+#   zed-ruby-test <file> <line>     run the test at that line
+#   zed-ruby-test --suite <file>    run the whole suite
+#
+# Called from ~/.config/zed/tasks.json. Lives here rather than inline in the
+# task because of one fact about my repositories: the Rails app is NOT at the
+# worktree root. Some are monorepos — backend/ holds the Rails
+# app, web/ the frontend — so $ZED_WORKTREE_ROOT and $ZED_RELATIVE_FILE both
+# point at a directory with no Gemfile in it. The task passes the absolute
+# $ZED_FILE and this script walks up to the nearest Gemfile to find the real
+# Rails root.
+#
+# It cds there before running, so .tool-versions resolves the right Ruby
+# through asdf's shims on its own — no version-manager logic belongs here.
+#
+# Tests: bash zed/bin/test_zed_ruby_test.sh
+
+set -uo pipefail
+
+die() { printf 'zed-ruby-test: %s\n' "$1" >&2; exit 1; }
+
+SUITE=0
+if [[ "${1:-}" == "--suite" ]]; then SUITE=1; shift; fi
+
+FILE="${1:-}"
+LINE="${2:-}"
+
+[[ -n "$FILE" ]] || die "no file given (Zed passes \$ZED_FILE)"
+[[ -f "$FILE" ]] || die "no such file: $FILE"
+
+# --- the Rails root is the nearest Gemfile above the open file -------------
+# Zed always passes an absolute $ZED_FILE, but this script is on PATH and its
+# usage line invites a relative one. $ROOT is built absolute below, so $FILE
+# has to be absolute too or stripping the prefix off it silently fails.
+DIR="$(cd "$(dirname "$FILE")" && pwd)"
+FILE="$DIR/$(basename "$FILE")"
+ROOT=""
+while [[ "$DIR" != "/" ]]; do
+  if [[ -f "$DIR/Gemfile" ]]; then ROOT="$DIR"; break; fi
+  DIR="$(dirname "$DIR")"
+done
+[[ -n "$ROOT" ]] || die "no Gemfile in any parent of $FILE"
+
+# --- which runner ----------------------------------------------------------
+# RSpec wins when a project has both: a Rails app that adopted RSpec usually
+# still carries a vestigial test/ directory from the generator.
+#
+# For Minitest, a test/ directory proves only that tests exist — NOT that Rails
+# does. `bundle exec rails test` in a plain Ruby gem is a command that cannot
+# run, so Rails is detected on its own terms (bin/rails or config/application.rb)
+# and everything else falls back to plain Minitest.
+if [[ -f "$ROOT/.rspec" || -d "$ROOT/spec" ]]; then
+  FRAMEWORK=rspec
+elif [[ -d "$ROOT/test" ]]; then
+  if [[ -f "$ROOT/bin/rails" || -f "$ROOT/config/application.rb" ]]; then
+    FRAMEWORK=rails-minitest
+  else
+    FRAMEWORK=minitest
+  fi
+else
+  die "neither spec/ nor test/ under $ROOT — can't tell RSpec from Minitest"
+fi
+
+# --- what to run -----------------------------------------------------------
+if [[ "$SUITE" -eq 1 ]]; then
+  case "$FRAMEWORK" in
+    rspec)          CMD=(bundle exec rspec) ;;
+    rails-minitest) CMD=(bundle exec rails test) ;;
+    minitest)       CMD=(bundle exec rake test) ;;
+  esac
+else
+  REL="${FILE#"$ROOT"/}"
+  case "$FRAMEWORK:$REL" in
+    rspec:spec/*|rails-minitest:test/*|minitest:test/*) : ;;
+    *) die "$REL is not a test file — use the full-suite task instead" ;;
+  esac
+  case "$FRAMEWORK" in
+    rspec)
+      [[ -n "$LINE" ]] && REL="$REL:$LINE"
+      CMD=(bundle exec rspec "$REL") ;;
+    rails-minitest)
+      [[ -n "$LINE" ]] && REL="$REL:$LINE"
+      CMD=(bundle exec rails test "$REL") ;;
+    minitest)
+      # Plain Minitest selects by name (-n /pattern/), not by line, so a cursor
+      # position cannot be honoured. Running the whole file beats refusing.
+      [[ -n "$LINE" ]] && printf 'zed-ruby-test: plain Minitest cannot target a line — running the whole file\n' >&2
+      CMD=(bundle exec ruby -Itest "$REL") ;;
+  esac
+fi
+
+# The seam the tests use: report the two decisions instead of acting on them.
+if [[ -n "${ZED_RUBY_TEST_DRY_RUN:-}" ]]; then
+  printf '%s\t%s\n' "$ROOT" "${CMD[*]}"
+  exit 0
+fi
+
+cd "$ROOT" || die "cannot enter $ROOT"
+printf '\033[0;34m==>\033[0m %s  \033[0;90m(%s)\033[0m\n' "${CMD[*]}" "$ROOT"
+exec "${CMD[@]}"

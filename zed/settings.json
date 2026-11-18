@@ -1,0 +1,191 @@
+// Zed — read, navigate and review generated code. Never write it.
+//
+// The agents (Claude Code, Codex) write the code in the terminal; this editor
+// only reads it. Every choice below follows from that one role, and the
+// viewer-safe block is the load-bearing part: opening a file must never
+// produce a diff in the agent's work.
+//
+// Verified against https://zed.dev/docs and zed-industries/zed@main
+// assets/settings/default.json. Keys move between releases — check before edit.
+{
+  // ─── Base ──────────────────────────────────────────────────────────────────
+  "cli_default_open_behavior": "existing_window",
+  "base_keymap": "VSCode",
+  // Ayu Darker over One Dark: a #080808 background against One Dark's #282c34,
+  // and every syntax token measured higher against it — body text 10.7:1 vs
+  // 6.6:1, keywords 7.6:1 vs 4.3:1. This editor only reads, so contrast is the
+  // whole job. Chosen against real code over One Dark - Darkened, One Black and
+  // Tokyo Night; One Dark, Ayu Dark, Ayu Mirage, Andromeda and Gruvbox Dark
+  // Hard remain available without installing anything, they ship with Zed.
+  "theme": "Ayu Darker",
+  // Per-language and per-folder icons in the project panel and the tab bar.
+  // Zed's own "Zed (Default)" is monochrome and distinguishes shape only.
+  "icon_theme": "Material Icon Theme",
+  // JetBrains Mono replaces .ZedMono for its taller x-height: it reads a size
+  // larger at the same 14px. It is the one thing in this file that has to be
+  // installed — `brew install --cask font-jetbrains-mono` — so a fresh Mac
+  // needs that before this line does anything; Zed falls back silently.
+  "buffer_font_family": "JetBrains Mono",
+  "buffer_font_size": 14,
+  "buffer_font_features": { "calt": true },
+  "tab_size": 2,
+  "minimap": { "show": "never" },
+
+  // ─── Contrast ──────────────────────────────────────────────────────────────
+  // Every dark theme measured ships its comments between 2.4:1 and 3.5:1
+  // against its own background — the token this editor reads most, and the one
+  // no theme gets right. Raised to 5.5:1 and italicised so they still read as
+  // secondary rather than as code. Overrides are keyed by theme name, so
+  // switching themes drops this: only the default is listed.
+  "theme_overrides": {
+    "Ayu Darker": {
+      "syntax": {
+        "comment": { "color": "#7d8794", "font_style": "italic" },
+        "comment.doc": { "color": "#7d8794", "font_style": "italic" }
+      }
+    }
+  },
+  // Nesting depth is structure, and reading code you did not write is mostly
+  // reading structure. "indent_aware" colours each level differently; Zed's
+  // "fixed" default paints every level the same grey. enabled and line_width
+  // are left to their defaults — nested objects merge, unlike the array below.
+  "indent_guides": {
+    "coloring": "indent_aware",
+    "active_line_width": 2
+  },
+
+  // ─── Viewer-safe ───────────────────────────────────────────────────────────
+  // remove_trailing_whitespace_on_save and ensure_final_newline_on_save both
+  // default to TRUE, and either one will silently rewrite a file the agent just
+  // wrote — turning a read into a diff. Those two are the real inversions.
+  // format_on_save and autosave already default to off; they are pinned anyway
+  // because this is the one property of this file that must not drift.
+  "format_on_save": "off",
+  "autosave": "off",
+  "remove_trailing_whitespace_on_save": false,
+  "ensure_final_newline_on_save": false,
+
+  // ─── Telemetry ─────────────────────────────────────────────────────────────
+  // Client and employer code is opened in this editor, so Zed itself reports
+  // nothing about it. This covers telemetry only — see the AI block below for
+  // the one deliberate exception.
+  "telemetry": { "diagnostics": false, "metrics": false },
+
+  // ─── AI ────────────────────────────────────────────────────────────────────
+  // Nothing may compete with the terminal agents, but the agent panel stays
+  // available so Claude Code over ACP can be tried later. No agent server is
+  // configured, so nothing is sent anywhere today — but this is the deliberate
+  // exception to the line above: signing the panel in to a hosted model would
+  // put buffer contents of whatever repo is open in front of it. Set
+  // "disable_ai": true if that panel is never actually wanted.
+  "disable_ai": false,
+  "edit_predictions": { "provider": "none" },
+  "show_edit_predictions": false,
+  "agent": { "enabled": true, "button": true },
+
+  // ─── Extensions ────────────────────────────────────────────────────────────
+  // Declared, not clicked: a fresh Mac installs these on first launch.
+  // "html" is Zed's own default, repeated so this block replaces it cleanly.
+  "auto_install_extensions": {
+    // The theme and the icon set. Both are pure declarative JSON, no wasm.
+    "ayu-darker": true,
+    "material-icon-theme": true,
+    "html": true,
+    "ruby": true,
+    "sql": true,
+    "dockerfile": true,
+    "toml": true,
+    "terraform": true,
+    "env": true
+  },
+
+  // ─── Git review ────────────────────────────────────────────────────────────
+  "git": {
+    "git_gutter": "tracked_files",
+    "inline_blame": { "enabled": true, "delay_ms": 300, "show_commit_summary": true }
+  },
+  // "always", not Zed's "auto": the diff markers live in the scrollbar, so
+  // hiding it would defeat the point of turning them on.
+  "scrollbar": { "show": "always", "git_diff": true, "diagnostics": "all" },
+
+  // ─── Navigation ────────────────────────────────────────────────────────────
+  "preview_tabs": {
+    "enabled": true,
+    "enable_preview_from_project_panel": true,
+    // Defaults to false; single-click preview should be everywhere, not just the panel.
+    "enable_preview_from_file_finder": true
+  },
+  "project_panel": { "auto_reveal_entries": true },
+  "restore_on_startup": "last_session",
+
+  // ─── Terminal ──────────────────────────────────────────────────────────────
+  // "system" runs the login shell, so zsh brings asdf, PATH and the rest with it.
+  "terminal": {
+    "dock": "bottom",
+    "shell": "system",
+    "working_directory": "current_project_directory"
+  },
+
+  // ─── Project scan ──────────────────────────────────────────────────────────
+  // Zed's 11 defaults re-listed verbatim, then Rails noise. This list does NOT
+  // support the "..." extend syntax, so the defaults have to be repeated or
+  // they are lost. vendor/ and db/ are deliberately absent — both get read.
+  "file_scan_exclusions": [
+    "**/.git",
+    "**/.svn",
+    "**/.hg",
+    "**/.jj",
+    "**/.sl",
+    "**/.repo",
+    "**/CVS",
+    "**/.DS_Store",
+    "**/Thumbs.db",
+    "**/.classpath",
+    "**/.settings",
+    "**/tmp",
+    "**/log",
+    "**/coverage",
+    "**/node_modules",
+    "**/storage",
+    "**/public/assets",
+    "**/public/packs*",
+    "**/.bundle"
+  ],
+
+  // ─── Languages ─────────────────────────────────────────────────────────────
+  // "..." means "then the rest of the extension's servers, in its own order".
+  // It is kept because tailwindcss-language-server (which the Ruby extension
+  // opts Ruby strings into) lives in that tail — but it also drags in every
+  // other server the Ruby extension declares. Verified in Zed's log: opening a
+  // .rb file queued sorbet, steep, kanayago and fuzzy-ruby-server too, none of
+  // which is installed or wanted. Each is disabled by name so the tail keeps
+  // tailwind and nothing else.
+  //
+  // herb only declares HTML+ERB. YAML+ERB and JS+ERB get ruby-lsp alone;
+  // listing herb on them would be dead config.
+  //
+  // No file_types block: the Ruby extension already claims Gemfile, Rakefile,
+  // *.rake, *.ru, *.jbuilder, Guardfile, .irbrc, *.gemspec, Capfile and ~25 more.
+  "languages": {
+    "Ruby": {
+      "language_servers": ["ruby-lsp", "rubocop", "!solargraph", "!sorbet", "!steep", "!kanayago", "!fuzzy-ruby-server", "..."]
+    },
+    "HTML+ERB": {
+      "language_servers": ["herb", "ruby-lsp", "!solargraph", "!sorbet", "!steep", "!kanayago", "!fuzzy-ruby-server", "..."]
+    },
+    "YAML+ERB": {
+      "language_servers": ["ruby-lsp", "!solargraph", "!sorbet", "!steep", "!kanayago", "!fuzzy-ruby-server", "..."]
+    },
+    "JS+ERB": {
+      "language_servers": ["ruby-lsp", "!solargraph", "!sorbet", "!steep", "!kanayago", "!fuzzy-ruby-server", "..."]
+    },
+    "Markdown": { "soft_wrap": "editor_width" }
+  },
+  // use_bundler resolves servers through the project's Gemfile, which is what
+  // makes go-to-definition reach into a gem. It costs a generated .ruby-lsp/
+  // directory per Rails root — globally gitignored, see git/ignore.
+  "lsp": {
+    "ruby-lsp": { "settings": { "use_bundler": true } },
+    "rubocop": { "settings": { "use_bundler": true } }
+  }
+}

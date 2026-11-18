@@ -1,0 +1,19 @@
+# Global gitignore — editor and tooling droppings that must never reach a
+# project repository, personal or client.
+#
+# Installed to ~/.config/git/ignore, which git honours with no configuration
+# at all as long as core.excludesfile is unset. Versioned here so a second Mac
+# gets it from install.sh instead of a forgotten manual step.
+
+# Claude Code's per-machine settings override, which must never be committed
+# to a project repo.
+**/.claude/settings.local.json
+
+# Zed project-level settings. My environment is identical everywhere and lives
+# in ~/.config/zed; nothing Zed-specific belongs in a project.
+.zed/
+
+# ruby-lsp composes the project's Gemfile with itself into a generated bundle
+# here. Required for go-to-definition to reach into a gem, and entirely local —
+# so it is ignored globally rather than added to each repo's .gitignore.
+.ruby-lsp/

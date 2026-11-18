@@ -1,0 +1,90 @@
+#!/usr/bin/env bash
+#
+# ship — squash-merge the current branch's PR and clean up after it.
+#
+#   ship    (run from the branch's worktree)
+#
+# Merges the PR on GitHub, deletes the remote and the local branch, removes the
+# worktree and fast-forwards main in the main checkout. Every delete is proven
+# safe first, and anything unproven stops the run with the reason on stderr:
+#
+#   before the merge  clean worktree (untracked files included); HEAD is what
+#                     origin and the PR both have; the branch contains
+#                     origin/main; the PR is open, not a draft, MERGEABLE, and
+#                     every check is SUCCESS, NEUTRAL or SKIPPED (none is fine).
+#   the merge         --match-head-commit, so GitHub refuses if the PR moved.
+#   after the merge   the squash commit's tree equals the branch's tree. A
+#                     squash commit is never an ancestor of the branch, so
+#                     this, not `branch -d`, is what proves nothing is lost.
+#   remote branch     deleted with a lease on the proven sha (if GitHub has not
+#                     already deleted it).
+#   worktree          `git worktree remove` without --force: git refuses dirt.
+#   local branch      `branch -D`, its tip being the proven sha.
+#
+# main is only fast-forwarded when the main checkout is on main; otherwise it
+# warns, since the merge itself already happened.
+#
+# The worktree is the caller's working directory, so a session that runs ship
+# from it has nowhere left to work: ship is its last act.
+#
+# Exit: 0 shipped; 1 refused or failed, with the reason on stderr.
+
+set -euo pipefail
+
+die() { echo "ship: $*" >&2; exit 1; }
+
+branch="$(git branch --show-current)"
+[[ -n "$branch" ]] || die "detached HEAD — nothing to ship"
+[[ "$branch" != main ]] || die "on main — nothing to ship"
+
+top="$(git rev-parse --show-toplevel)"
+main_wt="$(git worktree list --porcelain | awk '/^worktree /{ print substr($0, 10); exit }')"
+[[ "$top" != "$main_wt" ]] || die "run it from the branch's worktree, not the main checkout"
+
+dirty="$(git status --porcelain)"
+[[ -z "$dirty" ]] || die "uncommitted files in $top:"$'\n'"$dirty"
+
+git fetch --quiet origin
+head="$(git rev-parse HEAD)"
+[[ "$(git rev-parse -q --verify "refs/remotes/origin/$branch" || true)" == "$head" ]] \
+  || die "HEAD differs from origin/$branch — push first"
+git merge-base --is-ancestor origin/main HEAD || die "$branch is behind origin/main — rebase first"
+
+pr="$(gh pr view --json number,state,isDraft,mergeable,headRefOid,statusCheckRollup)" \
+  || die "no PR found for $branch"
+field() { jq -r "$1" <<<"$pr"; }
+number="$(field .number)"
+[[ "$(field .state)" == OPEN ]] || die "PR #$number is $(field .state)"
+[[ "$(field .isDraft)" == false ]] || die "PR #$number is a draft"
+[[ "$(field .headRefOid)" == "$head" ]] || die "PR head $(field .headRefOid) is not HEAD $head"
+[[ "$(field .mergeable)" == MERGEABLE ]] \
+  || die "PR #$number is $(field .mergeable), not MERGEABLE (UNKNOWN: GitHub is still computing, retry)"
+not_green="$(field '(.statusCheckRollup // [])[]
+  | "\(.name // .context): \(if (.conclusion // "") != "" then .conclusion else (.state // "PENDING") end)"
+  | select(test(": (SUCCESS|NEUTRAL|SKIPPED)$") | not)')"
+[[ -z "$not_green" ]] || die "checks not green on PR #$number:"$'\n'"$not_green"
+
+gh pr merge "$number" --squash --match-head-commit "$head" || die "gh pr merge failed for PR #$number"
+
+merge="$(gh pr view "$number" --json mergeCommit | jq -r '.mergeCommit.oid // empty')"
+[[ -n "$merge" ]] || die "PR #$number merged, but GitHub reported no merge commit; branch and worktree kept"
+git fetch --quiet origin
+[[ "$(git rev-parse "$merge^{tree}")" == "$(git rev-parse "$head^{tree}")" ]] \
+  || die "PR #$number merged as $merge, but its tree differs from $branch ($head); branch and worktree kept"
+
+# GitHub may already have deleted it ("Automatically delete head branches").
+if git ls-remote --exit-code --quiet origin "refs/heads/$branch" >/dev/null; then
+  git push --quiet --force-with-lease="refs/heads/$branch:$head" origin ":refs/heads/$branch"
+fi
+cd "$main_wt"
+git worktree remove "$top"
+rmdir -p "$(dirname "$top")" 2>/dev/null || true
+git branch --quiet -D "$branch"
+
+if [[ "$(git branch --show-current)" == main ]]; then
+  git merge --quiet --ff-only origin/main || echo "ship: fast-forward failed, main not updated" >&2
+else
+  echo "ship: main checkout is not on main, main not updated" >&2
+fi
+
+echo "ship: PR #$number merged as $merge; $branch and its worktree removed"

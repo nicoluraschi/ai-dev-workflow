@@ -1,0 +1,13 @@
+# Pre-push guard for the public repo: gitleaks, the extra scanner, the private denylist,
+# commit metadata and ref names over exactly the commits being pushed, plus the root-commit and
+# push-URL checks. Fails closed. Reads the git pre-push stdin (use_stdin); the script passes the
+# remote name and URL on. Install with `lefthook install`; install.sh checks it is installed.
+#
+# A `scripts:` job, not `commands:` — lefthook 2 skips a pre-push command when the checked-out
+# branch has no file changes ("no matching push files"), which would let a push of commit
+# messages, tags, ref names or emails through unchecked. Scripts are never skipped that way.
+pre-push:
+  scripts:
+    "public-guard.sh":
+      runner: bash
+      use_stdin: true
